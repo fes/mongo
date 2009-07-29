@@ -54,6 +54,9 @@ namespace mongo {
             return 0;
         }
         
+        if ( e.isNumberLong() )
+            return (unsigned long long)e.number64();
+        
         if ( e.isNumber() )
             return (unsigned long long)e.number();
         

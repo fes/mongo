@@ -40,6 +40,9 @@ public:
         if ( element_.type() == NumberDouble ) *reinterpret_cast< double * >( value() )  = d;
         else if ( element_.type() == NumberInt ) *reinterpret_cast< int * >( value() ) = (int) d;
     }    
+    void setNumber(long long d) {
+        if ( element_.type() == NumberLong ) *reinterpret_cast< long long * >( value() )  = d;
+    }    
 
     /** Replace the type and value of the element with the type and value of e,
         preserving the original fieldName */

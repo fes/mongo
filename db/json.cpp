@@ -240,6 +240,7 @@ namespace mongo {
         ObjectBuilder &b;
     };
 
+		// @TODO - fes: What needs to be changed here?
     struct numberValue {
         numberValue( ObjectBuilder &_b ) : b( _b ) {}
         void operator() ( double d ) const {

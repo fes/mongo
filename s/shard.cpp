@@ -69,7 +69,11 @@ namespace mongo {
                 while( i.more() ) {
                     BSONElement e = i.next();
                     uassert( "can only handle numbers here - which i think is correct" , e.isNumber() );
-                    r.append( e.fieldName() , -1 * e.number() );
+										if(e.isNumberLong()) {
+                    	r.append( e.fieldName() , -1 * e.number64() );
+										} else {
+                    	r.append( e.fieldName() , -1 * e.number() );
+										}
                 }
                 
                 q.sort( r.obj() );

@@ -73,6 +73,9 @@ namespace mongo {
         void append(unsigned j) {
             append<unsigned>(j);
         }
+        void append(long long j) {
+            append<long long>(j);
+        }
         void append(bool j) {
             append<bool>(j);
         }

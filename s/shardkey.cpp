@@ -190,6 +190,14 @@ namespace mongo {
                 b.append(fn, x + (y - x)/2);
                 break;
             }
+        case NumberLong:
+            {
+                long long x = (long long) l.number64();
+                long long y = (long long) r.number64();
+                assert( y >= x );
+                b.append(fn, x + (y - x)/2);
+                break;
+            }
          default:
             {
                 stringstream ss;

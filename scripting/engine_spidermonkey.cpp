@@ -340,6 +340,12 @@ namespace mongo {
             return val;
         }
 
+        jsval tolval( long long d ){
+            jsval val;
+            assert( JS_NewNumberValue( _context, d , &val ) );
+            return val;
+        }
+
         jsval toval( const char * c ){
             JSString * s = JS_NewStringCopyZ( _context , c );
             assert( s );
@@ -368,6 +374,12 @@ namespace mongo {
             case NumberDouble:
             case NumberInt:
                 return toval( e.number() );
+            case NumberLong:
+								if(e.number64() > 0x3fffffffl || e.number64() < -0x3fffffffl) {
+                	return toval( e.number() );
+								} else {
+                	return toval( (int)e.number() );
+								}
             case Symbol: // TODO: should we make a special class for this
             case String:
                 return toval( e.valuestr() );

@@ -391,11 +391,24 @@ namespace mongo {
                 char * temp;
 
                 // TODO: this is how i guess if something is a number.  pretty lame right now
-                double number = strtod( val , &temp );
-                if ( temp != val )
-                    queryBuilder.append( field , number );
-                else
-                    queryBuilder.append( field , val );
+								do {
+									long long llval = strtoll( val, &temp, 10 );
+									if(!(llval == 0 && (errno == EINVAL))) {
+										queryBuilder.append( field, llval );
+										break;
+									}
+									long lval = strtol( val, &temp, 10 );
+									if(!(lval == 0 && (errno == EINVAL))) {
+										queryBuilder.append( field, (double) lval );
+										break;
+									}
+									double dval = strtod( val, &temp );
+									if(!(dval == 0 && (errno == EINVAL))) {
+										queryBuilder.append( field, dval );
+										break;
+									}
+                  queryBuilder.append( field , val );
+								} while(false);
             }
 
             BSONObj query = queryBuilder.obj();

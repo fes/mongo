@@ -84,8 +84,10 @@ namespace mongo {
         NumberInt = 16,
         /** Updated to a Date with value next OpTime on insert */
         Timestamp = 17,
+        /** 64 bit signed integer */
+        NumberLong = 18,
         /** max type that is not MaxKey */
-        JSTypeMax=17,
+        JSTypeMax=18,
         /** larger than all other types */
         MaxKey=127
     };
@@ -260,6 +262,8 @@ namespace mongo {
                     return *reinterpret_cast< const double* >( value() ) != 0;
                 case NumberInt:
                     return *reinterpret_cast< const int* >( value() ) != 0;
+                case NumberLong:
+                    return *reinterpret_cast< const long long* >( value() ) != 0;
                 case Bool:
                     return boolean();
                 case jstNULL:
@@ -272,7 +276,11 @@ namespace mongo {
 
         /** True if element is of a numeric type. */
         bool isNumber() const {
-            return type() == NumberDouble || type() == NumberInt;
+            return type() == NumberDouble || type() == NumberInt || type() == NumberLong;
+        }
+        /** True if element is of a numeric type. */
+        bool isNumberLong() const {
+            return type() == NumberLong;
         }
         /** Retrieve the numeric value of the element.  If not of a numeric type, returns 0. */
         double number() const {
@@ -281,6 +289,20 @@ namespace mongo {
                     return *reinterpret_cast< const double* >( value() );
                 case NumberInt:
                     return *reinterpret_cast< const int* >( value() );
+                case NumberLong:
+                    return *reinterpret_cast< const long long* >( value() );
+                default:
+                    return 0;
+            }
+        }
+        long long number64() const {
+            switch( type() ) {
+                case NumberDouble:
+                    return *reinterpret_cast< const double* >( value() );
+                case NumberInt:
+                    return *reinterpret_cast< const int* >( value() );
+                case NumberLong:
+                    return *reinterpret_cast< const long long* >( value() );
                 default:
                     return 0;
             }
@@ -370,6 +392,8 @@ namespace mongo {
            just the value.
         */
         bool valuesEqual(const BSONElement& r) const {
+            if ( isNumberLong() )
+                return number64() == r.number64() && r.isNumber();
             if ( isNumber() )
                 return number() == r.number() && r.isNumber();
             bool match= valuesize() == r.valuesize() &&
@@ -503,6 +527,7 @@ namespace mongo {
      OID:       an OID object
      NumberDouble: <double>
      NumberInt: <int32>
+     NumberLong:<int64>
      String:    <unsigned32 strsizewithnull><cstring>
      Date:      <8bytes>
      Regex:     <cstring regex><cstring options>
@@ -966,6 +991,17 @@ namespace mongo {
             append( fieldName.c_str(), n );
         }
         void append(const char *fieldName, unsigned n) { append(fieldName, (int) n); }
+        /** Append a 64 bit integer element */
+        void append(const char *fieldName, long long n) {
+            b.append((char) NumberLong);
+            b.append(fieldName);
+            b.append(n);
+        }
+        /** Append a 64 bit integer element */
+        void append(const string &fieldName, long long n) {
+            append( fieldName.c_str(), n );
+        }
+        void append(const char *fieldName, unsigned long long n) { append(fieldName, (long long) n); }
         /** Append a double element */
         BSONObjBuilder& append(const char *fieldName, double n) {
             b.append((char) NumberDouble);

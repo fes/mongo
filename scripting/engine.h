@@ -28,6 +28,7 @@ namespace mongo {
         virtual void externalSetup() = 0;
         
         virtual double getNumber( const char *field ) = 0;
+        //@FES virtual long long getLNumber( const char *field ) = 0;
         virtual string getString( const char *field ) = 0;
         virtual bool getBoolean( const char *field ) = 0;
         virtual BSONObj getObject( const char *field ) = 0;
@@ -35,6 +36,7 @@ namespace mongo {
         virtual int type( const char *field ) = 0;
 
         virtual void setNumber( const char *field , double val ) = 0;
+        //@FES virtual void setLNumber( const char *field , long long val ) = 0;
         virtual void setString( const char *field , const char * val ) = 0;
         virtual void setObject( const char *field , const BSONObj& obj , bool readOnly=true ) = 0;
         virtual void setBoolean( const char *field , bool val ) = 0;

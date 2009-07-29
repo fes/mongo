@@ -233,14 +233,16 @@ namespace mongo {
         const char *fieldName;
         double *ndouble;
         int *nint;
+        long long *nlong;
         BSONElement elt;
         int pushStartSize;
         void setn(double n) const {
             if ( ndouble ) *ndouble = n;
+            else if ( nlong ) *nlong = (long long) n;
             else *nint = (int) n;
         }
         double getn() const {
-            return ndouble ? *ndouble : *nint;
+            return ndouble ? *ndouble : nlong ? *nlong : *nint;
         }
         bool operator<( const Mod &other ) const {
             return strcmp( fieldName, other.fieldName ) < 0;
@@ -607,9 +609,15 @@ namespace mongo {
                 if ( f.type() == NumberDouble ) {
                     m.ndouble = (double *) f.value();
                     m.nint = 0;
+										m.nlong = 0;
                 } else if ( f.type() == NumberInt ) {
                     m.ndouble = 0;
                     m.nint = (int *) f.value();
+										m.nlong = 0;
+                } else if ( f.type() == NumberLong ) {
+                    m.ndouble = 0;
+                    m.nint = 0;
+                    m.nlong = (long long*) f.value();
                 }
                 mods_.push_back( m );
             }

@@ -69,6 +69,11 @@ namespace mongo {
             s << number();
             //s << "(" << ( type() == NumberInt ? "int" : "double" ) << ")";
             break;
+        case NumberLong:
+            s.precision( 16 );
+            s << number64();
+            //s << "(" << ( type() == NumberLong ? "long" : "double" ) << ")";
+            break;
         case Bool:
             s << ( boolean() ? "true" : "false" );
             break;
@@ -188,6 +193,10 @@ namespace mongo {
         case Symbol:
             s << '"' << escape( valuestr() ) << '"';
             break;
+        case NumberLong:
+          s.precision( 16 );
+          s << number64();
+					break;
         case NumberInt:
         case NumberDouble:
             if ( number() >= -numeric_limits< double >::max() &&
@@ -333,6 +342,7 @@ namespace mongo {
         case NumberInt:
             x = 4;
             break;
+        case NumberLong:
         case Timestamp:
         case Date:
         case NumberDouble:
@@ -419,9 +429,18 @@ namespace mongo {
     int BSONElement::woCompare( const BSONElement &e,
                                 bool considerFieldName ) const {
         int lt = (int) type();
-        if ( lt == NumberInt ) lt = NumberDouble;
+        if ( lt == NumberInt || lt == NumberLong ) lt = NumberDouble;
         int rt = (int) e.type();
-        if ( rt == NumberInt ) rt = NumberDouble;
+        if ( rt == NumberInt || rt == NumberLong ) rt = NumberDouble;
+				/*
+				int lt = (int) type();
+				int rt = (int) e.type();
+				if(lt != rt && (lt == NumberLong || rt == NumberLong)) {
+				} else {
+								if ( lt == NumberInt ) lt = NumberDouble;
+								if ( rt == NumberInt ) rt = NumberDouble;
+				}
+				*/
 
         int x = lt - rt;
         if ( x != 0 )
@@ -475,6 +494,26 @@ namespace mongo {
             x = left - right;
             if ( x < 0 ) return -1;
             return x == 0 ? 0 : 1;
+            }
+        case NumberLong: {
+            long long left = l.number64();
+            long long right = r.number64();
+            bool lNan = !( left <= numeric_limits< long long >::max() &&
+                         left >= -numeric_limits< long long >::max() );
+            bool rNan = !( right <= numeric_limits< long long >::max() &&
+                         right >= -numeric_limits< long long >::max() );
+            if ( lNan ) {
+                if ( rNan ) {
+                    return 0;
+                } else {
+                    return -1;
+                }
+            } else if ( rNan ) {
+                return 1;
+            }
+            long long xl = left - right;
+            if ( xl < 0 ) return -1;
+            return xl == 0 ? 0 : 1;
             }
         case jstOID:
             return memcmp(l.value(), r.value(), 12);

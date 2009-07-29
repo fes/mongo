@@ -586,6 +586,7 @@ namespace mongo {
             BSONObjBuilder spec;
             if ( capped ) {
                 spec.appendBool( "capped", true );
+								// @TODO - fes: Anything?
                 spec.append( "size", double( size ) );
             }
             if ( !userCreateNS( target.c_str(), spec.done(), errmsg, true ) )

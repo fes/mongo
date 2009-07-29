@@ -58,12 +58,14 @@ namespace mongo {
         void scopeFree( jlong id );
 
         double scopeGetNumber( jlong id , const char * field );
+        jlong scopeGetLNumber( jlong id , const char * field );
         string scopeGetString( jlong id , const char * field );
         jboolean scopeGetBoolean( jlong id , const char * field );
         BSONObj scopeGetObject( jlong id , const char * field );
         char scopeGetType( jlong id , const char * field );
 
         int scopeSetNumber( jlong id , const char * field , double val );
+        int scopeSetLNumber( jlong id , const char * field , jlong val );
         int scopeSetString( jlong id , const char * field , const char * val );
         int scopeSetObject( jlong id , const char * field , const BSONObj * obj );
         int scopeSetBoolean( jlong id , const char * field , jboolean val );
@@ -172,6 +174,9 @@ namespace mongo {
         double getNumber(const char *field) {
             return JavaJS->scopeGetNumber(s,field);
         }
+        jlong getLNumber(const char *field) {
+            return JavaJS->scopeGetLNumber(s,field);
+        }
         string getString(const char *field) {
             return JavaJS->scopeGetString(s,field);
         }
@@ -191,6 +196,9 @@ namespace mongo {
 
         void setNumber(const char *field, double val ) {
             JavaJS->scopeSetNumber(s,field,val);
+        }
+        void setLNumber(const char *field, long long val ) {
+            JavaJS->scopeSetLNumber(s,field,val);
         }
         void setString(const char *field, const char * val ) {
             JavaJS->scopeSetString(s,field,val);
