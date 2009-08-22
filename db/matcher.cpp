@@ -79,26 +79,22 @@ namespace mongo {
     class Where {
     public:
         Where() {
-            scope = 0;
             jsScope = 0;
         }
         ~Where() {
 
-            if ( scope )
-                delete scope;
-
-            if ( jsScope )
+            if ( jsScope ){
                 delete jsScope;
-            scope = 0;
+            }
             func = 0;
         }
         
-        Scope * scope;
+        auto_ptr<Scope> scope;
         ScriptingFunction func;
         BSONObj *jsScope;
         
         void setFunc(const char *code) {
-            massert( "scope has to be created first!" , scope );
+            massert( "scope has to be created first!" , scope.get() );
             func = scope->createFunction( code );
         }
 
@@ -146,7 +142,8 @@ namespace mongo {
                 where = new Where();
                 uassert( "$where query, but no script engine", globalScriptEngine );
 
-                where->scope = globalScriptEngine->createScope();
+                assert( curNs );
+                where->scope = globalScriptEngine->getPooledScope( curNs );
                 where->scope->localConnect( database->name.c_str() );
 
                 if ( e.type() == CodeWScope ) {
@@ -236,12 +233,22 @@ namespace mongo {
                                 addBasic(b->done().firstElement(), BSONObj::NE);
                                 ok = true;
                             }
+                            else if ( fn[1] == 'r' && fn[3] == 'f' && fn[4] == 0 ){
+                                // { $ref : xxx } - treat as normal object
+                                ok = false;
+                                break;
+                            }
                             else
                                 uassert("invalid $operator", false);
                         }
                         else if ( fn[1] == 'i' && fn[2] == 'n' && fn[3] == 0 && fe.type() == Array ) {
                             // $in
                             basics.push_back( BasicMatcher( e , BSONObj::opIN , fe.embeddedObject() ) );
+                            ok = true;
+                        }
+                        else if ( fn[1] == 'm' && fn[2] == 'o' && fn[3] == 'd' && fn[4] == 0 && fe.type() == Array ) {
+                            // $mod
+                            basics.push_back( BasicMatcher( e , BSONObj::opMOD ) );
                             ok = true;
                         }
                         else if ( fn[1] == 'n' && fn[2] == 'i' && fn[3] == 'n' && fn[4] == 0 && fe.type() == Array ) {
@@ -255,7 +262,7 @@ namespace mongo {
                             ok = true;
                             all = true;
                         }
-                        else if ( fn[1] == 's' && fn[2] == 'i' && fn[3] == 'z' && fn[4] == 'e' && fe.isNumber() ) {
+                        else if ( fn[1] == 's' && fn[2] == 'i' && fn[3] == 'z' && fn[4] == 'e' && fn[5] == 0 && fe.isNumber() ) {
                             shared_ptr< BSONObjBuilder > b( new BSONObjBuilder() );
                             builders_.push_back( b );
                             b->appendAs(fe, e.fieldName());
@@ -263,8 +270,15 @@ namespace mongo {
                             haveSize = true;
                             ok = true;
                         }
+                        else if ( fn[1] == 'e' && fn[2] == 'x' && fn[3] == 'i' && fn[4] == 's' && fn[5] == 't' && fn[6] == 's' && fn[7] == 0 && fe.isBoolean() ) {
+                            shared_ptr< BSONObjBuilder > b( new BSONObjBuilder() );
+                            builders_.push_back( b );
+                            b->appendAs(fe, e.fieldName());
+                            addBasic(b->done().firstElement(), BSONObj::opEXISTS);
+                            ok = true;
+                        }
                         else
-                            uassert("invalid $operator", false);
+                            uassert( (string)"invalid $operator: " + fn , false);
                     }
                     else {
                         ok = false;
@@ -307,26 +321,13 @@ namespace mongo {
             return count == r.number();
         }
         
-        if ( op == BSONObj::opALL ) {
-            if ( l.type() != Array )
-                return 0;
-            set< BSONElement, element_lt > matches;
-            BSONObjIterator i( l.embeddedObject() );
-            while( i.moreWithEOO() ) {
-                BSONElement e = i.next();
-                if ( e.eoo() )
-                    break;
-                if ( bm.myset->count( e ) )
-                    matches.insert( e );
-            }
-            if ( matches.size() > 0 && bm.myset->size() == matches.size() ) {
-                if ( deep )
-                    *deep = true;
-                return true;
-            }
-            return false;
+        if ( op == BSONObj::opMOD ){
+            if ( ! l.isNumber() )
+                return false;
+            
+            return l.numberLong() % bm.mod == bm.modm;
         }
-        
+
         /* check LT, GTE, ... */
         if ( !( l.isNumber() && r.isNumber() ) && ( l.type() != r.type() ) )
             return false;
@@ -339,7 +340,16 @@ namespace mongo {
 
     int JSMatcher::matchesNe(const char *fieldName, const BSONElement &toMatch, const BSONObj &obj, const BasicMatcher& bm, bool *deep) {
         int ret = matchesDotted( fieldName, toMatch, obj, BSONObj::Equality, bm, deep );
-        return -ret;
+        if ( bm.toMatch.type() != jstNULL )
+            return ( ret <= 0 ) ? 1 : 0;
+        else
+            return -ret;
+    }
+
+    int retMissing( const BasicMatcher &bm ) {
+        if ( bm.compareOp != BSONObj::opEXISTS )
+            return 0;
+        return bm.toMatch.boolean() ? -1 : 1;
     }
     
     /* Check if a particular field matches.
@@ -364,6 +374,26 @@ namespace mongo {
     */
     int JSMatcher::matchesDotted(const char *fieldName, const BSONElement& toMatch, const BSONObj& obj, int compareOp, const BasicMatcher& bm , bool *deep, bool isArr) {
 
+        if ( compareOp == BSONObj::opALL ) {
+            if ( bm.myset->size() == 0 )
+                return -1; // is this desired?
+            BSONObjSetDefaultOrder actualKeys;
+            getKeysFromObject( BSON( fieldName << 1 ), obj, actualKeys );
+            if ( actualKeys.size() == 0 )
+                return 0;
+            for( set< BSONElement, element_lt >::const_iterator i = bm.myset->begin(); i != bm.myset->end(); ++i ) {
+                // ignore nulls
+                if ( i->type() == jstNULL )
+                    continue;
+                // parallel traversal would be faster worst case I guess
+                BSONObjBuilder b;
+                b.appendAs( *i, "" );
+                if ( !actualKeys.count( b.done() ) )
+                    return -1;
+            }
+            return 1;
+        }
+
         if ( compareOp == BSONObj::NE )
             return matchesNe( fieldName, toMatch, obj, bm, deep );
         if ( compareOp == BSONObj::NIN ) {
@@ -371,7 +401,6 @@ namespace mongo {
                 int ret = matchesNe( fieldName, *i, obj, bm, deep );
                 if ( ret != 1 )
                     return ret;
-                // code to handle 0 (missing) return value doesn't deal with nin yet
             }
             return 1;
         }
@@ -398,7 +427,7 @@ namespace mongo {
                         }
                     }
                 }
-                return found ? -1 : 0;
+                return found ? -1 : retMissing( bm );
             }
             const char *p = strchr(fieldName, '.');
             if ( p ) {
@@ -406,9 +435,9 @@ namespace mongo {
 
                 BSONElement se = obj.getField(left.c_str());
                 if ( se.eoo() )
-                    return 0;
+                    return retMissing( bm );
                 if ( se.type() != Object && se.type() != Array )
-                    return -1;
+                    return retMissing( bm );
 
                 BSONObj eo = se.embeddedObject();
                 return matchesDotted(p+1, toMatch, eo, compareOp, bm, deep, se.type() == Array);
@@ -416,11 +445,13 @@ namespace mongo {
                 e = obj.getField(fieldName);
             }
         }
-        
-        if ( ( e.type() != Array || indexed || compareOp == BSONObj::opALL || compareOp == BSONObj::opSIZE ) &&
+
+        if ( compareOp == BSONObj::opEXISTS ) {
+            return ( e.eoo() ^ toMatch.boolean() ) ? 1 : -1;
+        } else if ( ( e.type() != Array || indexed || compareOp == BSONObj::opSIZE ) &&
             valuesMatch(e, toMatch, compareOp, bm, deep) ) {
             return 1;
-        } else if ( e.type() == Array && compareOp != BSONObj::opALL && compareOp != BSONObj::opSIZE ) {
+        } else if ( e.type() == Array && compareOp != BSONObj::opSIZE ) {
             BSONObjIterator ai(e.embeddedObject());
             while ( ai.moreWithEOO() ) {
                 BSONElement z = ai.next();
@@ -594,7 +625,7 @@ namespace mongo {
 
         RXTest() {
         }
-
+        
         void run() {
             /*
             static const boost::regex e("(\\d{4}[- ]){3}\\d{4}");
@@ -602,6 +633,12 @@ namespace mongo {
             out() << "regex result: " << regex_match("hello", e) << endl;
             out() << "regex result: " << regex_match("abcoo", b) << endl;
             */
+
+            int ret = 0;
+            
+            pcre_config( PCRE_CONFIG_UTF8 , &ret );
+            massert( "pcre not compiled with utf8 support" , ret );
+
             pcrecpp::RE re1(")({a}h.*o");
             pcrecpp::RE re("h.llo");
             assert( re.FullMatch("hello") );
@@ -612,11 +649,6 @@ namespace mongo {
             options.set_utf8(true);
             pcrecpp::RE part("dwi", options);
             assert( part.PartialMatch("dwight") );
-
-            int ret = 0;
-            
-            pcre_config( PCRE_CONFIG_UTF8 , &ret );
-            assert( ret );
 
             pcre_config( PCRE_CONFIG_UNICODE_PROPERTIES , &ret );
             if ( ! ret )

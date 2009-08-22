@@ -20,6 +20,7 @@
 #include "dbhelpers.h"
 #include "json.h"
 #include "../client/dbclient.h"
+#include "repl.h"
 
 namespace mongo {
 
@@ -110,14 +111,19 @@ namespace mongo {
        If 'client' is not specified, the current client is used.
     */
     inline bool isMaster( const char *client = 0 ) {
+		if( !slave ) 
+			return true;
+
         if ( !client )
             client = database->name.c_str();
-        if ( replAllDead ) {
-            return strcmp( client, "local" ) == 0;
-        }
 
-        if ( replPair == 0 || replPair->state == ReplPair::State_Master )
-            return true;
+        if ( replAllDead )
+            return strcmp( client, "local" ) == 0;
+
+        if ( replPair ) {
+			if( replPair->state == ReplPair::State_Master )
+				return true;
+		}
 
         return strcmp( client, "local" ) == 0;
     }

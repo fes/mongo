@@ -1,10 +1,14 @@
-/** @file jsobj.h */
+/** @file jsobj.h 
+    BSON classes
+*/
 
 /**
    BSONObj and its helpers
 
    "BSON" stands for "binary JSON" -- ie a binary way to represent objects that would be
    represented in JSON (plus a few extensions useful for databases & other languages).
+
+   http://www.mongodb.org/display/DOCS/BSON
 */
 
 /**
@@ -84,7 +88,7 @@ namespace mongo {
         NumberInt = 16,
         /** Updated to a Date with value next OpTime on insert */
         Timestamp = 17,
-        /** 64 bit signed integer */
+        /** 64 bit integer */
         NumberLong = 18,
         /** max type that is not MaxKey */
         JSTypeMax=18,
@@ -258,12 +262,12 @@ namespace mongo {
             */
         bool trueValue() const {
             switch( type() ) {
+                case NumberLong:
+                    return *reinterpret_cast< const long long* >( value() ) != 0;
                 case NumberDouble:
                     return *reinterpret_cast< const double* >( value() ) != 0;
                 case NumberInt:
                     return *reinterpret_cast< const int* >( value() ) != 0;
-                case NumberLong:
-                    return *reinterpret_cast< const long long* >( value() ) != 0;
                 case Bool:
                     return boolean();
                 case jstNULL:
@@ -276,25 +280,85 @@ namespace mongo {
 
         /** True if element is of a numeric type. */
         bool isNumber() const {
-            return type() == NumberDouble || type() == NumberInt || type() == NumberLong;
+            switch( type() ) {
+                case NumberLong:
+                case NumberDouble:
+                case NumberInt:
+                    return true;
+                default: 
+                    return false;
+            }
         }
-        /** True if element is of a numeric type. */
+
         bool isNumberLong() const {
             return type() == NumberLong;
         }
-        /** Retrieve the numeric value of the element.  If not of a numeric type, returns 0. */
-        double number() const {
+
+        bool isSimpleType() const {
+            switch( type() ){
+            case NumberLong:
+            case NumberDouble:
+            case NumberInt:
+            case String:
+            case Bool:
+            case Date:
+                return true;
+            default: 
+                return false;
+            }
+        }
+
+        /** Return double value for this field. MUST be NumberDouble type. */
+        double _numberDouble() const {return *reinterpret_cast< const double* >( value() ); }
+        /** Return double value for this field. MUST be NumberInt type. */
+        int _numberInt() const {return *reinterpret_cast< const int* >( value() ); }
+        /** Return double value for this field. MUST be NumberLong type. */
+        long long _numberLong() const {return *reinterpret_cast< const long long* >( value() ); }
+
+        /** Retrieve int value for the element safely.  Zero returned if not a number. */
+        int numberInt() const { 
             switch( type() ) {
                 case NumberDouble:
-                    return *reinterpret_cast< const double* >( value() );
+                    return (int) _numberDouble();
                 case NumberInt:
-                    return *reinterpret_cast< const int* >( value() );
+                    return _numberInt();
                 case NumberLong:
-                    return *reinterpret_cast< const long long* >( value() );
+                    return (int) _numberLong();
                 default:
                     return 0;
             }
         }
+
+        /** Retrieve long value for the element safely.  Zero returned if not a number. */
+        long long numberLong() const { 
+            switch( type() ) {
+                case NumberDouble:
+                    return (long long) _numberDouble();
+                case NumberInt:
+                    return _numberInt();
+                case NumberLong:
+                    return _numberLong();
+                default:
+                    return 0;
+            }
+        }
+
+        /** Retrieve the numeric value of the element.  If not of a numeric type, returns 0. 
+            NOTE: casts to double, data loss may occur with large (>52 bit) NumberLong values.
+        */
+        double numberDouble() const {
+            switch( type() ) {
+                case NumberDouble:
+                    return _numberDouble();
+                case NumberInt:
+                    return *reinterpret_cast< const int* >( value() );
+                case NumberLong:
+                    return (double) *reinterpret_cast< const long long* >( value() );
+                default:
+                    return 0;
+            }
+        }
+
         long long number64() const {
             switch( type() ) {
                 case NumberDouble:
@@ -307,6 +371,11 @@ namespace mongo {
                     return 0;
             }
         }
+        /** Retrieve the numeric value of the element.  If not of a numeric type, returns 0. 
+            NOTE: casts to double, data loss may occur with large (>52 bit) NumberLong values.
+        */
+        double number() const { return numberDouble(); }
+
         /** Retrieve the object ID stored in the object. 
             You must ensure the element is of type jstOID first. */
         const OID &__oid() const {
@@ -361,6 +430,20 @@ namespace mongo {
 
         BSONObj codeWScopeObject() const;
 
+        string ascode() const {
+            switch( type() ){
+            case String:
+            case Code:
+                return valuestr();
+            case CodeWScope:
+                return codeWScopeCode();
+            default:
+                log() << "can't convert type: " << (int)(type()) << " to code" << endl;
+            }
+            uassert( "not code" , 0 );
+            return "";
+        }
+
         /** Get binary data.  Element must be of type BinData */
         const char *binData(int& len) const { 
             // BinData: <int len> <byte subtype> <byte[len] data>
@@ -381,7 +464,13 @@ namespace mongo {
             assert(type() == RegEx);
             return value();
         }
-        const char *simpleRegex() const;
+
+        /** returns a string that when used as a matcher, would match a super set of regex() 
+			returns "" for complex regular expressions
+			used to optimize queries in some simple regex cases that start with '^'
+		 */
+        string simpleRegex() const;
+
         /** Retrieve the regex flags (options) for a Regex element */
         const char *regexFlags() const {
             const char *p = regex();
@@ -392,14 +481,19 @@ namespace mongo {
            just the value.
         */
         bool valuesEqual(const BSONElement& r) const {
-            if ( isNumberLong() )
-                return number64() == r.number64() && r.isNumber();
-            if ( isNumber() )
-                return number() == r.number() && r.isNumber();
+            switch( type() ) {
+                case NumberLong:
+                    return _numberLong() == r.numberLong() && r.isNumber();
+                case NumberDouble:
+                    return _numberDouble() == r.number() && r.isNumber();
+                case NumberInt:
+                    return _numberInt() == r.numberInt() && r.isNumber();
+                default:
+                    ;
+            }
             bool match= valuesize() == r.valuesize() &&
                         memcmp(value(),r.value(),valuesize()) == 0;
             return match && type() == r.type();
-            // todo: make "0" == 0.0
         }
 
         /** Returns true if elements are equal. */
@@ -824,6 +918,8 @@ namespace mongo {
             opSIZE = 0x0A,
             opALL = 0x0B,
             NIN = 0x0C,
+            opEXISTS = 0x0D,
+            opMOD = 0x0E
         };        
     };
     ostream& operator<<( ostream &s, const BSONObj &o );
@@ -831,7 +927,7 @@ namespace mongo {
 
     class BSONObjCmp {
     public:
-        BSONObjCmp( const BSONObj &_order ) : order( _order ) {}
+        BSONObjCmp( const BSONObj &_order = BSONObj() ) : order( _order ) {}
         bool operator()( const BSONObj &l, const BSONObj &r ) const {
             return l.woCompare( r, order ) < 0;
         }
@@ -855,7 +951,7 @@ namespace mongo {
     BSON( "a" << GT << 23.4 << NE << 30 << "b" << 2 ) produces the object
     { a: { \$gt: 23.4, \$ne: 30 }, b: 2 }.
 */
-#define BSON(x) (( BSONObjBuilder() << x ).obj())
+#define BSON(x) (( mongo::BSONObjBuilder() << x ).obj())
 
     // Utility class to implement GT, GTE, etc as described above.
     class Labeler {
@@ -980,6 +1076,7 @@ namespace mongo {
             b.append(fieldName);
             b.append((char) (val?1:0));
         }
+
         /** Append a 32 bit integer element */
         void append(const char *fieldName, int n) {
             b.append((char) NumberInt);
@@ -990,18 +1087,17 @@ namespace mongo {
         void append(const string &fieldName, int n) {
             append( fieldName.c_str(), n );
         }
+
+        /** Append a 32 bit unsigned element - cast to a signed int. */
         void append(const char *fieldName, unsigned n) { append(fieldName, (int) n); }
-        /** Append a 64 bit integer element */
-        void append(const char *fieldName, long long n) {
+
+        /** Append a NumberLong */
+        void append(const char *fieldName, long long n) { 
             b.append((char) NumberLong);
             b.append(fieldName);
             b.append(n);
         }
-        /** Append a 64 bit integer element */
-        void append(const string &fieldName, long long n) {
-            append( fieldName.c_str(), n );
-        }
-        void append(const char *fieldName, unsigned long long n) { append(fieldName, (long long) n); }
+
         /** Append a double element */
         BSONObjBuilder& append(const char *fieldName, double n) {
             b.append((char) NumberDouble);
@@ -1009,6 +1105,7 @@ namespace mongo {
             b.append(n);
             return *this;
         }
+
         /** Append a BSON Object ID (OID type). */
         void appendOID(const char *fieldName, OID *oid = 0) {
             b.append((char) jstOID);
@@ -1170,6 +1267,12 @@ namespace mongo {
         void appendWhere( const string &code, const BSONObj &scope ){
             appendWhere( code.c_str(), scope );
         }
+        
+        /**
+           these are the min/max when comparing, not strict min/max elements for a given type
+         */
+        void appendMinForType( const string& field , int type );
+        void appendMaxForType( const string& field , int type );
 
         /** Append an array of values. */
         template < class T >
@@ -1228,9 +1331,15 @@ namespace mongo {
             return s_;
         }
 
+        // prevent implicit string conversions which would allow bad things like BSON( BSON( "foo" << 1 ) << 2 )
+        struct ForceExplicitString {
+        ForceExplicitString( const string &str ) : str_( str ) {}
+            string str_;
+        };
+
         /** Stream oriented way to add field names and values. */
-        BSONObjBuilderValueStream &operator<<( const string& name ) {
-            return operator<<( name.c_str() );
+        BSONObjBuilderValueStream &operator<<( const ForceExplicitString& name ) {
+            return operator<<( name.str_.c_str() );
         }
 
         Labeler operator<<( const Labeler::Label &l ) {

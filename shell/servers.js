@@ -39,7 +39,8 @@ createMongoArgs = function( binaryName , args ){
             }
             else {
                 fullArgs.push( "--" + k );
-                fullArgs.push( "" + o[k] );
+                if ( o[k] != "" )
+                    fullArgs.push( "" + o[k] );
             }
         }
     }
@@ -86,7 +87,7 @@ startMongoProgram = function(){
         } catch( e ) {
         }
         return false;
-    }, "unable to connect to mongo program on port " + port, 10000 );
+    }, "unable to connect to mongo program on port " + port, 30000 );
 
     return m;
 }
@@ -111,7 +112,7 @@ ShardingTest = function( testName , numServers , verboseLevel , numMongos ){
     this._serverNames = [];
 
     for ( var i=0; i<numServers; i++){
-        var conn = startMongod( { port : 30000 + i , dbpath : "/data/db/" + testName + i } );
+        var conn = startMongod( { port : 30000 + i , dbpath : "/data/db/" + testName + i , noprealloc : "" } );
         conn.name = "localhost:" + ( 30000 + i );
 
         this._connections.push( conn );
@@ -213,6 +214,7 @@ MongodRunner.prototype.start = function( reuseData ) {
         args.push( "1" );
     }
     args.push( "--nohttpinterface" );
+    args.push( "--noprealloc" );
     args.push( "--bind_ip" );
     args.push( "127.0.0.1" );
     if ( this.extraArgs_ ) {

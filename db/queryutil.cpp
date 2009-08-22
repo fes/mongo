@@ -23,112 +23,121 @@
 #include "queryoptimizer.h"
 
 namespace mongo {
-
-    FieldBound::FieldBound( const BSONElement &e ) :
-    lower_( minKey.firstElement() ),
-    lowerInclusive_( true ),
-    upper_( maxKey.firstElement() ),
-    upperInclusive_( true ) {
+    
+    FieldRange::FieldRange( const BSONElement &e, bool optimize ) {
+        lower() = minKey.firstElement();
+        lowerInclusive() = true;
+        upper() = maxKey.firstElement();
+        upperInclusive() = true;
         if ( e.eoo() )
             return;
         if ( e.type() == RegEx ) {
-            const char *r = e.simpleRegex();
-            if ( r ) {
-                lower_ = addObj( BSON( "" << r ) ).firstElement();
-                upper_ = addObj( BSON( "" << simpleRegexEnd( r ) ) ).firstElement();
-                upperInclusive_ = false;
+            const string r = e.simpleRegex();
+            if ( r.size() ) {
+                lower() = addObj( BSON( "" << r ) ).firstElement();
+                upper() = addObj( BSON( "" << simpleRegexEnd( r ) ) ).firstElement();
+                upperInclusive() = false;
             }            
             return;
         }
         switch( e.getGtLtOp() ) {
-            case BSONObj::Equality:
-                lower_ = e;
-                upper_ = e;
-                break;
-            case BSONObj::LT:
-                upperInclusive_ = false;
-            case BSONObj::LTE:
-                upper_ = e;
-                break;
-            case BSONObj::GT:
-                lowerInclusive_ = false;
-            case BSONObj::GTE:
-                lower_ = e;
-                break;
+        case BSONObj::Equality:
+            lower() = e;
+            upper() = e;
+            break;
+        case BSONObj::LT:
+            upperInclusive() = false;
+        case BSONObj::LTE:
+            upper() = e;
+            break;
+        case BSONObj::GT:
+            lowerInclusive() = false;
+        case BSONObj::GTE:
+            lower() = e;
+            break;
 	    case BSONObj::opALL: {
 	        massert( "$all requires array", e.type() == Array );
-		BSONObjIterator i( e.embeddedObject() );
-		if ( i.moreWithEOO() ) {
- 		    BSONElement f = i.next();
-		    if ( !f.eoo() )
-		      lower_ = upper_ = f;
-		}
-		break;
-	    }
-	    case BSONObj::opIN: {
-                massert( "$in requires array", e.type() == Array );
-                BSONElement max = minKey.firstElement();
-                BSONElement min = maxKey.firstElement();
-                BSONObjIterator i( e.embeddedObject() );
-                while( i.moreWithEOO() ) {
-                    BSONElement f = i.next();
-                    if ( f.eoo() )
-                        break;
-                    if ( max.woCompare( f, false ) < 0 )
-                        max = f;
-                    if ( min.woCompare( f, false ) > 0 )
-                        min = f;
-                }
-                lower_ = min;
-                upper_ = max;
+            BSONObjIterator i( e.embeddedObject() );
+            if ( i.moreWithEOO() ) {
+                BSONElement f = i.next();
+                if ( !f.eoo() )
+                    lower() = upper() = f;
             }
-            default:
-                break;
+            break;
+	    }
+        case BSONObj::opMOD: {
+            break;
         }
-
-        if ( lower_.isNumber() && upper_.type() == MaxKey ){
-            upper_ = addObj( BSON( lower_.fieldName() << numeric_limits<double>::max() ) ).firstElement();
+	    case BSONObj::opIN: {
+            massert( "$in requires array", e.type() == Array );
+            BSONElement max = minKey.firstElement();
+            BSONElement min = maxKey.firstElement();
+            BSONObjIterator i( e.embeddedObject() );
+            while( i.moreWithEOO() ) {
+                BSONElement f = i.next();
+                if ( f.eoo() )
+                    break;
+                if ( max.woCompare( f, false ) < 0 )
+                    max = f;
+                if ( min.woCompare( f, false ) > 0 )
+                    min = f;
+            }
+            lower() = min;
+            upper() = max;
         }
-        else if ( upper_.isNumber() && lower_.type() == MinKey ){
-            lower_ = addObj( BSON( upper_.fieldName() << - numeric_limits<double>::max() ) ).firstElement();
+        default:
+            break;
+        }
+        
+        if ( optimize ){
+            if ( lower().type() != MinKey && upper().type() == MaxKey && lower().isSimpleType() ){ // TODO: get rid of isSimpleType
+                BSONObjBuilder b;
+                b.appendMaxForType( lower().fieldName() , lower().type() );
+                upper() = addObj( b.obj() ).firstElement();
+            }
+            else if ( lower().type() == MinKey && upper().type() != MaxKey && upper().isSimpleType() ){ // TODO: get rid of isSimpleType
+                BSONObjBuilder b;
+                b.appendMinForType( upper().fieldName() , upper().type() );
+                lower() = addObj( b.obj() ).firstElement();
+            }
         }
 
     }
     
-    const FieldBound &FieldBound::operator&=( const FieldBound &other ) {
+    const FieldRange &FieldRange::operator&=( const FieldRange &other ) {
         int cmp;
-        cmp = other.upper_.woCompare( upper_, false );
+        cmp = other.max().woCompare( upper(), false );
         if ( cmp == 0 )
-            if ( !other.upperInclusive_ )
-                upperInclusive_ = false;
+            if ( !other.maxInclusive() )
+                upperInclusive() = false;
         if ( cmp < 0 ) {
-            upper_ = other.upper_;
-            upperInclusive_ = other.upperInclusive_;
+            upper() = other.max();
+            upperInclusive() = other.maxInclusive();
         }
-        cmp = other.lower_.woCompare( lower_, false );
+        cmp = other.min().woCompare( lower(), false );
         if ( cmp == 0 )
-            if ( !other.lowerInclusive_ )
-                lowerInclusive_ = false;
+            if ( !other.minInclusive() )
+                lowerInclusive() = false;
         if ( cmp > 0 ) {
-            lower_ = other.lower_;
-            lowerInclusive_ = other.lowerInclusive_;
+            lower() = other.min();
+            lowerInclusive() = other.minInclusive();
         }
         for( vector< BSONObj >::const_iterator i = other.objData_.begin(); i != other.objData_.end(); ++i )
             objData_.push_back( *i );
         return *this;
     }
     
-    string FieldBound::simpleRegexEnd( string regex ) {
+    string FieldRange::simpleRegexEnd( string regex ) {
         ++regex[ regex.length() - 1 ];
         return regex;
     }    
     
-    BSONObj FieldBound::addObj( const BSONObj &o ) {
+    BSONObj FieldRange::addObj( const BSONObj &o ) {
         objData_.push_back( o );
         return o;
     }
     
-    FieldBoundSet::FieldBoundSet( const char *ns, const BSONObj &query ) :
+    FieldRangeSet::FieldRangeSet( const char *ns, const BSONObj &query , bool optimize ) :
     ns_( ns ),
     query_( query.getOwned() ) {
         BSONObjIterator i( query_ );
@@ -139,7 +148,7 @@ namespace mongo {
             if ( strcmp( e.fieldName(), "$where" ) == 0 )
                 continue;
             if ( getGtLtOp( e ) == BSONObj::Equality ) {
-                bounds_[ e.fieldName() ] &= FieldBound( e );
+                ranges_[ e.fieldName() ] &= FieldRange( e , optimize );
             }
             else {
                 BSONObjIterator i( e.embeddedObject() );
@@ -147,24 +156,24 @@ namespace mongo {
                     BSONElement f = i.next();
                     if ( f.eoo() )
                         break;
-                    bounds_[ e.fieldName() ] &= FieldBound( f );
+                    ranges_[ e.fieldName() ] &= FieldRange( f , optimize );
                 }                
             }
         }
     }
     
-    FieldBound *FieldBoundSet::trivialBound_ = 0;
-    FieldBound &FieldBoundSet::trivialBound() {
-        if ( trivialBound_ == 0 )
-            trivialBound_ = new FieldBound();
-        return *trivialBound_;
+    FieldRange *FieldRangeSet::trivialRange_ = 0;
+    FieldRange &FieldRangeSet::trivialRange() {
+        if ( trivialRange_ == 0 )
+            trivialRange_ = new FieldRange();
+        return *trivialRange_;
     }
     
-    BSONObj FieldBoundSet::simplifiedQuery( const BSONObj &_fields ) const {
+    BSONObj FieldRangeSet::simplifiedQuery( const BSONObj &_fields ) const {
         BSONObj fields = _fields;
         if ( fields.isEmpty() ) {
             BSONObjBuilder b;
-            for( map< string, FieldBound >::const_iterator i = bounds_.begin(); i != bounds_.end(); ++i ) {
+            for( map< string, FieldRange >::const_iterator i = ranges_.begin(); i != ranges_.end(); ++i ) {
                 b.append( i->first.c_str(), 1 );
             }
             fields = b.obj();
@@ -176,29 +185,29 @@ namespace mongo {
             if ( e.eoo() )
                 break;
             const char *name = e.fieldName();
-            const FieldBound &bound = bounds_[ name ];
-            if ( bound.equality() )
-                b.appendAs( bound.lower(), name );
-            else if ( bound.nontrivial() ) {
+            const FieldRange &range = ranges_[ name ];
+            if ( range.equality() )
+                b.appendAs( range.min(), name );
+            else if ( range.nontrivial() ) {
                 BSONObjBuilder c;
-                if ( bound.lower().type() != MinKey )
-                    c.appendAs( bound.lower(), bound.lowerInclusive() ? "$gte" : "$gt" );
-                if ( bound.upper().type() != MaxKey )
-                    c.appendAs( bound.upper(), bound.upperInclusive() ? "$lte" : "$lt" );
+                if ( range.min().type() != MinKey )
+                    c.appendAs( range.min(), range.minInclusive() ? "$gte" : "$gt" );
+                if ( range.max().type() != MaxKey )
+                    c.appendAs( range.max(), range.maxInclusive() ? "$lte" : "$lt" );
                 b.append( name, c.done() );                
             }
         }
         return b.obj();
     }
     
-    QueryPattern FieldBoundSet::pattern( const BSONObj &sort ) const {
+    QueryPattern FieldRangeSet::pattern( const BSONObj &sort ) const {
         QueryPattern qp;
-        for( map< string, FieldBound >::const_iterator i = bounds_.begin(); i != bounds_.end(); ++i ) {
+        for( map< string, FieldRange >::const_iterator i = ranges_.begin(); i != ranges_.end(); ++i ) {
             if ( i->second.equality() ) {
                 qp.fieldTypes_[ i->first ] = QueryPattern::Equality;
             } else if ( i->second.nontrivial() ) {
-                bool upper = i->second.upper().type() != MaxKey;
-                bool lower = i->second.lower().type() != MinKey;
+                bool upper = i->second.max().type() != MaxKey;
+                bool lower = i->second.min().type() != MinKey;
                 if ( upper && lower )
                     qp.fieldTypes_[ i->first ] = QueryPattern::UpperAndLowerBound;
                 else if ( upper )
@@ -216,14 +225,11 @@ namespace mongo {
         while ( i.more() ){
             string s = i.next().fieldName();
             if ( s.find( "." ) == string::npos ){
-                fields[ s ] = "";
+                fields.insert( pair<string,string>( s , "" ) );
             }
             else {
                 string sub = s.substr( 0 , s.find( "." ) );
-                if ( fields[sub].size() )
-                    fields[sub] = ".";
-                else
-                    fields[sub] = s.substr( sub.size() + 1 );
+                fields.insert(pair<string,string>( sub , s.substr( sub.size() + 1 ) ) );
             }
         }
 
@@ -239,7 +245,7 @@ namespace mongo {
     
     BSONObj FieldMatcher::getSpec() const{
         BSONObjBuilder b;
-        for ( map<string,string>::const_iterator i=fields.begin(); i!=fields.end(); i++){
+        for ( multimap<string,string>::const_iterator i=fields.begin(); i!=fields.end(); i++ ) {
             string s = i->first;
             if ( i->second.size() > 0 )
                 s += "." + i->second;
@@ -248,33 +254,49 @@ namespace mongo {
         return b.obj();
     }
 
-    BSONObj FieldMatcher::extractDotted( const string& path , const BSONObj& o ) const {
+    void FieldMatcher::extractDotted( const string& path , const BSONObj& o , BSONObjBuilder& b ) const {
         string::size_type i = path.find( "." );
-        if ( i == string::npos )
-            return o.getField( path.c_str() ).wrap();
+        if ( i == string::npos ){
+            const BSONElement & e = o.getField( path.c_str() );
+            if ( e.eoo() )
+                return;
+            b.append(e);
+            return;
+        }
         
         string left = path.substr( 0 , i );
         BSONElement e = o[left];
         if ( e.type() != Object )
-            return BSONObj();
+            return;
 
         BSONObj sub = e.embeddedObject();
         if ( sub.isEmpty() )
-            return sub;
+            return;
         
-        BSONObjBuilder b(32);
-        b.append( left.c_str() , extractDotted( path.substr( i + 1 ) , sub ) );
-        return b.obj();
+        BSONObjBuilder sub_b(32);
+        extractDotted( path.substr( i + 1 ) , sub , sub_b );
+        b.append( left.c_str() , sub_b.obj() );
     }
     
     void FieldMatcher::append( BSONObjBuilder& b , const BSONElement& e ) const {
-        string next = fields.find( e.fieldName() )->second;
-        if ( next.size() == 0 || next == "." || e.type() != Object ){
-            b.append( e );
+        pair<multimap<string,string>::const_iterator,multimap<string,string>::const_iterator> p = fields.equal_range( e.fieldName() );
+        BSONObjBuilder sub_b(32);
+
+        for( multimap<string,string>::const_iterator i = p.first; i != p.second; ++i ) {
+            string next = i->second;
+
+            if ( e.eoo() ){
+            }
+            else if ( next.size() == 0 || next == "." || e.type() != Object ){
+                b.append( e );
+                return;
+            }
+            else {
+                extractDotted( next , e.embeddedObject() , sub_b );
+            }
         }
-        else {
-            b.append( e.fieldName() , extractDotted( next , e.embeddedObject() ) );
-        }
+
+        b.append( e.fieldName() , sub_b.obj() );
     }
     
 } // namespace mongo

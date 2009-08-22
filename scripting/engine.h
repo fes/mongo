@@ -47,7 +47,7 @@ namespace mongo {
         /**
          * @return 0 on success
          */
-        virtual int invoke( ScriptingFunction func , const BSONObj& args, int timeoutMs = 0 ) = 0;
+        virtual int invoke( ScriptingFunction func , const BSONObj& args, int timeoutMs = 0 , bool ignoreReturn = false ) = 0;
         void invokeSafe( ScriptingFunction func , const BSONObj& args, int timeoutMs = 0 ){
             assert( invoke( func , args , timeoutMs ) == 0 );
         }
@@ -78,6 +78,9 @@ namespace mongo {
         virtual bool utf8Ok() const = 0;
 
         static void setup();
+
+        auto_ptr<Scope> getPooledScope( const string& pool );
+        void threadDone();
     };
 
     extern ScriptEngine * globalScriptEngine;

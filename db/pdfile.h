@@ -33,6 +33,8 @@
 
 namespace mongo {
 
+  extern bool prealloc;
+
     class MDFHeader;
     class Extent;
     class Record;
@@ -44,6 +46,7 @@ namespace mongo {
     void dropCollection( const string &name, string &errmsg, BSONObjBuilder &result ); // also deletes indexes and cursors
     bool userCreateNS(const char *ns, BSONObj j, string& err, bool logForReplication);
     auto_ptr<Cursor> findTableScan(const char *ns, const BSONObj& order, const DiskLoc &startLoc=DiskLoc());
+    void getKeysFromObject( const BSONObj &keyPattern, const BSONObj &obj, BSONObjSetDefaultOrder &keys );
 
 // -1 if library unavailable.
     boost::intmax_t freeSpace();
@@ -91,17 +94,17 @@ namespace mongo {
     class DataFileMgr {
         friend class BasicCursor;
     public:
-        void init(const char *);
+        void init(const string& path );
 
         void update(
             const char *ns,
             Record *toupdate, const DiskLoc& dl,
             const char *buf, int len, stringstream& profiling);
         // The object o may be updated if modified on insert.                                
-        void insertAndLog( const char *ns, const BSONObj &o );
-        DiskLoc insert(const char *ns, BSONObj &o);
-        DiskLoc insert(const char *ns, const void *buf, int len, bool god = false, const BSONElement &writeId = BSONElement());
-        void deleteRecord(const char *ns, Record *todelete, const DiskLoc& dl, bool cappedOK = false);
+        void insertAndLog( const char *ns, const BSONObj &o, bool god = false );
+        DiskLoc insert(const char *ns, BSONObj &o, bool god = false);
+        DiskLoc insert(const char *ns, const void *buf, int len, bool god = false, const BSONElement &writeId = BSONElement(), bool mayAddIndex = true);
+        void deleteRecord(const char *ns, Record *todelete, const DiskLoc& dl, bool cappedOK = false, bool noWarn = false);
         static auto_ptr<Cursor> findAll(const char *ns, const DiskLoc &startLoc = DiskLoc());
 
         /* special version of insert for transaction logging -- streamlined a bit.
@@ -374,7 +377,7 @@ namespace mongo {
         virtual const char * op() const = 0;
     };
 
-    void _applyOpToDataFiles( const char *database, FileOp &fo, bool afterAllocator = false, const char *path = dbpath );
+    void _applyOpToDataFiles( const char *database, FileOp &fo, bool afterAllocator = false, const string& path = dbpath );
 
     inline void _deleteDataFiles(const char *database) {
         class : public FileOp {

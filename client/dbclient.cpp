@@ -61,6 +61,11 @@ namespace mongo {
         return *this; 
     }
     
+    Query& Query::snapshot() {
+        appendComplex( "$snapshot", true );
+        return *this; 
+    }
+    
     Query& Query::minKey( const BSONObj &val ) {
         appendComplex( "$min", val );
         return *this; 
@@ -286,6 +291,35 @@ namespace mongo {
         BSONObj info;
         BSONElement retValue;
         return eval(dbname, jscode, info, retValue);
+    }
+
+    list<string> DBClientWithCommands::getDatabaseNames(){
+        BSONObj info;
+        uassert( "listdatabases failed" , runCommand( "admin" , BSON( "listDatabases" << 1 ) , info ) );
+        uassert( "listDatabases.databases not array" , info["databases"].type() == Array );
+        
+        list<string> names;
+        
+        BSONObjIterator i( info["databases"].embeddedObjectUserCheck() );
+        while ( i.more() ){
+            names.push_back( i.next().embeddedObjectUserCheck()["name"].valuestr() );
+        }
+
+        return names;
+    }
+
+    list<string> DBClientWithCommands::getCollectionNames( const string& db ){
+        list<string> names;
+        
+        string ns = db + ".system.namespaces";
+        auto_ptr<DBClientCursor> c = query( ns.c_str() , BSONObj() );
+        while ( c->more() ){
+            string name = c->next()["name"].valuestr();
+            if ( name.find( "$" ) != string::npos )
+                continue;
+            names.push_back( name );
+        }
+        return names;
     }
 
     void testSort() { 
@@ -539,12 +573,8 @@ namespace mongo {
                     ss << "_";
 
                 ss << f.fieldName() << "_";
-
-                if ( f.type() == NumberInt )
-                    ss << (int)(f.number() );
-                else if ( f.type() == NumberDouble )
-                    ss << f.number();
-
+                if( f.isNumber() )
+                    ss << f.numberInt();
             }
 
             toSave.append( "name" , ss.str() );
@@ -573,7 +603,6 @@ namespace mongo {
         // see query.h for the protocol we are using here.
         BufBuilder b;
         int opts = queryOptions;
-        assert( (opts&Option_ALLMASK) == opts );
         b.append(opts);
         b.append(ns.c_str());
         b.append(nToSkip);
@@ -788,6 +817,12 @@ namespace mongo {
         return master == Left ? left : right;
     }
 
+    DBClientConnection& DBClientPaired::slaveConn(){
+        DBClientConnection& m = checkMaster();
+        assert( ! m.isFailed() );
+        return master == Left ? right : left;
+    }
+
     bool DBClientPaired::connect(const string &serverHostname1, const string &serverHostname2) {
         string errmsg;
         bool l = left.connect(serverHostname1, errmsg);
@@ -802,6 +837,12 @@ namespace mongo {
             return false;
         }
         return true;
+    }
+
+    bool DBClientPaired::connect(string hostpairstring) { 
+        size_t comma = hostpairstring.find( "," );
+        uassert("bad hostpairstring", comma != string::npos);
+        return connect( hostpairstring.substr( 0 , comma ) , hostpairstring.substr( comma + 1 ) );
     }
 
 	bool DBClientPaired::auth(const string &dbname, const string &username, const string &pwd, string& errmsg) { 

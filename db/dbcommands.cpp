@@ -35,6 +35,7 @@
 #include "lasterror.h"
 #include "security.h"
 #include "queryoptimizer.h"
+#include "../scripting/engine.h"
 
 namespace mongo {
 
@@ -215,12 +216,13 @@ namespace mongo {
                 // if running without auth, you must be on localhost
                 AuthenticationInfo *ai = authInfo.get();
                 if( ai == 0 || !ai->isLocalHost ) {
+                    log() << "ignoring shutdown cmd from client, not from localhost and running without auth" << endl;
                     errmsg = "unauthorized [2]";
                     return false;
                 }
             }
             log() << "terminating, shutdown command received" << endl;
-            dbexit(EXIT_SUCCESS);
+            dbexit( EXIT_CLEAN );
             return true;
         }
     } cmdShutdown;
@@ -514,7 +516,6 @@ namespace mongo {
         if ( *name == '*' && name[1] == 0 ) {
             log() << "  d->nIndexes was " << d->nIndexes << '\n';
             anObjBuilder.append("nIndexesWas", (double)d->nIndexes);
-            anObjBuilder.append("msg", "all indexes deleted for collection");
             IndexDetails *idIndex = 0;
             if( d->nIndexes ) { 
                 for ( int i = 0; i < d->nIndexes; i++ ) {
@@ -532,6 +533,7 @@ namespace mongo {
             }
             /* assuming here that id index is not multikey: */
             d->multiKeyIndexBits = 0;
+            anObjBuilder.append("msg", "all indexes deleted for collection");
         }
         else {
             // delete just one index
@@ -585,6 +587,7 @@ namespace mongo {
                 errmsg = "ns not found";
                 return false;
             }
+            uassert( "can't drop collection with reserved $ character in name", strchr(nsToDrop.c_str(), '$') == 0 );
             dropCollection( nsToDrop, errmsg, result );
             return true;
         }
@@ -628,7 +631,8 @@ namespace mongo {
             return false;
         }
         virtual bool slaveOk() {
-            return false;
+			// ok on --slave setups, not ok for nonmaster of a repl pair (unless override)
+            return slave == SimpleSlave;
         }
         virtual bool slaveOverrideOk() {
             return true;
@@ -943,6 +947,42 @@ namespace mongo {
         }
     } cmdDatasize;
 
+    class CollectionStats : public Command {
+    public:
+        CollectionStats() : Command( "collstats" ) {}
+        virtual bool slaveOk() { return true; }
+        virtual void help( stringstream &help ) const {
+            help << " example: { collstats:\"blog.posts\" } ";
+        }
+        bool run(const char *dbname, BSONObj& jsobj, string& errmsg, BSONObjBuilder& result, bool fromRepl ){
+            string ns = dbname;
+            if ( ns.find( "." ) != string::npos )
+                ns = ns.substr( 0 , ns.find( "." ) );
+            ns += ".";
+            ns += jsobj.firstElement().valuestr();
+            
+            NamespaceDetails * nsd = nsdetails( ns.c_str() );
+            if ( ! nsd ){
+                errmsg = "ns not found";
+                return false;
+            }
+            
+            result.append( "ns" , ns.c_str() );
+            
+            result.append( "count" , nsd->nrecords );
+            result.append( "size" , nsd->datasize );
+            result.append( "storageSize" , nsd->storageSize() );
+            result.append( "nindexes" , nsd->nIndexes );
+
+            if ( nsd->capped ){
+                result.append( "capped" , nsd->capped );
+                result.append( "max" , nsd->max );
+            }
+
+            return true;
+        }
+    } cmdCollectionStatis;
+
     class CmdBuildInfo : public Command {
     public:
         CmdBuildInfo() : Command( "buildinfo" ) {}
@@ -1013,7 +1053,7 @@ namespace mongo {
             auto_ptr< DBClientCursor > c = client.getMore( fromNs, id );
             while( c->more() ) {
                 BSONObj obj = c->next();
-                theDataFileMgr.insertAndLog( toNs.c_str(), obj );
+                theDataFileMgr.insertAndLog( toNs.c_str(), obj, true );
             }
             
             return true;
@@ -1065,6 +1105,120 @@ namespace mongo {
             return true;
         }
     } cmdConvertToCapped;
+
+    class GroupCommand : public Command {
+    public:
+        GroupCommand() : Command("group"){}
+        virtual bool slaveOk() { return true; }
+        virtual void help( stringstream &help ) const {
+            help << "example: TODO";
+        }
+
+        BSONObj getKey( const BSONObj& obj , const BSONObj& keyPattern , const string keyFunction , double avgSize ){
+            BSONObjBuilder b( (int)(avgSize * 1.1) );
+
+            BSONObjIterator i( keyPattern );
+            while ( i.more() ){
+                const char * n = i.next().fieldName();
+                BSONElement e = obj[n];
+                if ( e.eoo() )
+                    b.appendNull( n );
+                else
+                    b.append( e );
+            }
+
+            return b.obj();
+        }
+        
+        bool group( string realdbname , auto_ptr<DBClientCursor> cursor , BSONObj keyPattern , string keyFunction , string reduceCode , BSONObj initial , string& errmsg , BSONObjBuilder& result ){
+
+            if ( keyFunction.size() ){
+                errmsg = "can't only handle real keys right now, not functions";
+                return false;
+            }
+
+            auto_ptr<Scope> s = globalScriptEngine->getPooledScope( realdbname );
+            s->localConnect( realdbname.c_str() );
+
+            s->setObject( "$initial" , initial , true );
+            
+            s->exec( "$reduce = " + reduceCode , "reduce setup" , false , true , true , 100 );
+            s->exec( "$arr = [];" , "reduce setup 2" , false , true , true , 100 );
+            ScriptingFunction f = s->createFunction( "function(){ "
+                                                     "  if ( $arr[n] == null ){ next = {}; Object.extend( next , $key ); Object.extend( next , $initial ); $arr[n] = next; next = null; }"
+                                                     "  $reduce( obj , $arr[n] ); "
+                                                     "}" );
+
+            double keysize = keyPattern.objsize() * 3;
+            double keynum = 1;
+            
+            map<BSONObj,int,BSONObjCmp> map;
+            list<BSONObj> blah;
+            
+            while ( cursor->more() ){
+                BSONObj obj = cursor->next();
+                BSONObj key = getKey( obj , keyPattern , keyFunction , keysize / keynum );
+                keysize += key.objsize();
+                keynum++;
+                
+                int& n = map[key];
+                if ( n == 0 ){
+                    n = map.size();
+                    s->setObject( "$key" , key , true );
+                }
+                
+                s->setObject( "obj" , obj , true );
+                s->setNumber( "n" , n - 1 );
+                uassert( "reduce invoke failed" , s->invoke( f , BSONObj() , 0 , true ) == 0 );
+            }
+            
+            result.appendArray( "retval" , s->getObject( "$arr" ) );
+            result.append( "count" , keynum - 1 );
+            result.append( "keys" , (int)(map.size()) );
+
+            return true;
+        }
+        
+        bool run(const char *dbname, BSONObj& jsobj, string& errmsg, BSONObjBuilder& result, bool fromRepl ){
+            static DBDirectClient db;
+
+            const BSONObj& p = jsobj.firstElement().embeddedObjectUserCheck();
+            
+            BSONObj q;
+            if ( p["cond"].type() == Object )
+                q = p["cond"].embeddedObject();
+            
+            string ns = dbname;
+            ns = ns.substr( 0 , ns.size() - 4 );
+            string realdbname = ns.substr( 0 , ns.size() - 1 );
+            
+            if ( p["ns"].type() != String ){
+                errmsg = "ns has to be set";
+                return false;
+            }
+            
+            ns += p["ns"].valuestr();
+
+            auto_ptr<DBClientCursor> cursor = db.query( ns , q );
+            
+            BSONObj key;
+            string keyf;
+            if ( p["key"].type() == Object ){
+                key = p["key"].embeddedObjectUserCheck();
+                if ( ! p["$keyf"].eoo() ){
+                    errmsg = "can't have key and $keyf";
+                    return false;
+                }
+            }
+            else if ( p["$keyf"].type() ){
+                keyf = p["$keyf"].ascode();
+            }
+
+
+            return group( realdbname , cursor , key , keyf , p["$reduce"].ascode() , p["initial"].embeddedObjectUserCheck() , errmsg , result );
+        }
+        
+    } cmdGroup;
     
     extern map<string,Command*> *commands;
 

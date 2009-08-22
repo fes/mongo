@@ -38,7 +38,7 @@ namespace mongo {
 
     bool dbEval(const char *ns, BSONObj& cmd, BSONObjBuilder& result, string& errmsg) {
         BSONElement e = cmd.firstElement();
-        assert( e.type() == Code || e.type() == CodeWScope || e.type() == String );
+        uassert( "eval needs Code" , e.type() == Code || e.type() == CodeWScope || e.type() == String );
 
         const char *code = 0;
         switch ( e.type() ) {
@@ -59,8 +59,7 @@ namespace mongo {
             return false;
         }
 
-        auto_ptr<Scope> s( globalScriptEngine->createScope() );
-
+        auto_ptr<Scope> s = globalScriptEngine->getPooledScope( ns );
         ScriptingFunction f = s->createFunction(code);
         if ( f == 0 ) {
             errmsg = (string)"compile failed: " + s->getError();
@@ -115,7 +114,7 @@ namespace mongo {
         else if ( type == jstNULL || type == Undefined )
             result.appendNull("retval");
         else if ( type == Date )
-            result.appendDate( "retval" , s->getNumber( "return" ) );
+            result.appendDate( "retval" , (unsigned long long) s->getNumber( "return" ) );
         else {
             stringstream temp;
             temp << "can't handle return type from db.eval:";

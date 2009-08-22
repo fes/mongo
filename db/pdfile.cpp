@@ -44,7 +44,7 @@ namespace mongo {
     extern bool quota;
     extern int port;
 
-    const char *dbpath = "/data/db/";
+    string dbpath = "/data/db/";
 
     DataFileMgr theDataFileMgr;
     map<string,Database*> databases;
@@ -53,6 +53,7 @@ namespace mongo {
     int MAGIC = 0x1000;
     int curOp = -2;
     int callDepth = 0;
+    bool prealloc = true;
 
     extern int otherTraceLevel;
     void addNewNamespaceToCatalog(const char *ns, const BSONObj *options = 0);
@@ -265,7 +266,9 @@ namespace mongo {
         assert( size % 4096 == 0 );
 
         if ( preallocateOnly ) {
+	  if ( prealloc ) {
             theFileAllocator().requestAllocation( filename, size );
+	  }
             return;
         }
         
@@ -565,7 +568,7 @@ assert( !eloc.isNull() );
     /* drop a collection/namespace */
     void dropNS(const string& nsToDrop) {
         NamespaceDetails* d = nsdetails(nsToDrop.c_str());
-        uassert( "ns not found", d );
+        uassert( (string)"ns not found: " + nsToDrop , d );
 
         uassert( "can't drop system ns", strstr(nsToDrop.c_str(), ".system.") == 0 );
         {
@@ -607,12 +610,19 @@ assert( !eloc.isNull() );
     }
 
     void dropCollection( const string &name, string &errmsg, BSONObjBuilder &result ) {
+        log(1) << "dropCollection: " << name << endl;
         NamespaceDetails *d = nsdetails(name.c_str());
         assert( d );
         if ( d->nIndexes != 0 ) {
-            assert( deleteIndexes(d, name.c_str(), "*", errmsg, result, true) );
+            try { 
+                assert( deleteIndexes(d, name.c_str(), "*", errmsg, result, true) );
+            }
+            catch( DBException& ) {
+                uasserted("drop: deleteIndexes for collection failed - consider trying repair");
+            }
             assert( d->nIndexes == 0 );
         }
+        log(1) << "\t deleteIndexes dones" << endl;
         result.append("ns", name.c_str());
         ClientCursor::invalidate(name.c_str());
         dropNS(name);        
@@ -643,6 +653,80 @@ assert( !eloc.isNull() );
         wassert( n == 1 );
     }
 
+  void getKeys( vector< const char * > fieldNames, vector< BSONElement > fixed, const BSONObj &obj, BSONObjSetDefaultOrder &keys ) {
+    BSONObjBuilder b;
+    b.appendNull( "" );
+    BSONElement nullElt = b.done().firstElement();
+    BSONElement arrElt;
+    unsigned arrIdx = ~0;
+    for( unsigned i = 0; i < fieldNames.size(); ++i ) {
+      if ( *fieldNames[ i ] == '\0' )
+	continue;
+      BSONElement e = obj.getFieldDottedOrArray( fieldNames[ i ] );
+      if ( e.eoo() )
+	e = nullElt; // no matching field
+      if ( e.type() != Array )
+	fieldNames[ i ] = ""; // no matching field or non-array match
+      if ( *fieldNames[ i ] == '\0' )
+	fixed[ i ] = e; // no need for further object expansion (though array expansion still possible)
+      if ( e.type() == Array && arrElt.eoo() ) { // we only expand arrays on a single path -- track the path here
+	arrIdx = i;
+	arrElt = e;
+      }
+      // enforce single array path here
+      uassert( "cannot index parallel arrays", e.type() != Array || e.rawdata() == arrElt.rawdata() );
+    }
+    bool allFound = true; // have we found elements for all field names in the key spec?
+    for( vector< const char * >::const_iterator i = fieldNames.begin(); allFound && i != fieldNames.end(); ++i )
+      if ( **i != '\0' )
+	allFound = false;
+    if ( allFound ) {
+      if ( arrElt.eoo() ) {
+	// no terminal array element to expand
+	BSONObjBuilder b;
+	for( vector< BSONElement >::iterator i = fixed.begin(); i != fixed.end(); ++i )
+	  b.appendAs( *i, "" );
+	keys.insert( b.obj() );
+      } else {
+	// terminal array element to expand, so generate all keys
+	BSONObjIterator i( arrElt.embeddedObject() );
+	while( i.more() ) {
+	  BSONObjBuilder b;
+	  for( unsigned j = 0; j < fixed.size(); ++j ) {
+	    if ( j == arrIdx )
+	      b.appendAs( i.next(), "" );
+	    else
+	      b.appendAs( fixed[ j ], "" );
+	  }
+	  keys.insert( b.obj() );
+	}
+      }
+    } else {
+      // nonterminal array element to expand, so recurse
+      assert( !arrElt.eoo() );
+      BSONObjIterator i( arrElt.embeddedObject() );
+      while( i.more() ) {
+	BSONElement e = i.next();
+	if ( e.type() == Object )
+	  getKeys( fieldNames, fixed, e.embeddedObject(), keys );
+      }
+    }
+  }
+
+  void getKeysFromObject( const BSONObj &keyPattern, const BSONObj &obj, BSONObjSetDefaultOrder &keys ) {
+    BSONObjIterator i( keyPattern );
+    vector< const char * > fieldNames;
+    vector< BSONElement > fixed;
+    BSONObjBuilder nullKey;
+    while( i.more() ) {
+      fieldNames.push_back( i.next().fieldName() );
+      fixed.push_back( BSONElement() );
+      nullKey.appendNull( "" );
+    }
+    getKeys( fieldNames, fixed, obj, keys );
+    if ( keys.empty() )
+      keys.insert( nullKey.obj() );
+  }
 
     /* Pull out the relevant key objects from obj, so we
        can index them.  Note that the set is multiple elements
@@ -651,74 +735,12 @@ assert( !eloc.isNull() );
     */
     void IndexDetails::getKeysFromObject( const BSONObj& obj, BSONObjSetDefaultOrder& keys) const {
         BSONObj keyPattern = info.obj().getObjectField("key"); // e.g., keyPattern == { ts : 1 }
-        if ( keyPattern.objsize() == 0 ) {
-            out() << keyPattern.toString() << endl;
-            out() << info.obj().toString() << endl;
-            assert(false);
-        }
-        BSONObjBuilder b;
-        const char *nameWithinArray;
-        BSONObj key = obj.extractFieldsDotted(keyPattern, b, nameWithinArray);
-        massert( "new key empty", !key.isEmpty() );
-        BSONObjIterator keyIter( key );
-        BSONElement arrayElt;
-        int arrayPos = -1;
-        for ( int i = 0; keyIter.moreWithEOO(); ++i ) {
-            BSONElement e = keyIter.next();
-            if ( e.eoo() )
-                break;
-            if ( e.type() == Array ) {
-                uassert( "Index cannot be created on parallel arrays.",
-                         arrayPos == -1 );
-                arrayPos = i;
-                arrayElt = e;
-            }
-        }
-        if ( arrayPos == -1 ) {
-            assert( strlen( nameWithinArray ) == 0 );
-            BSONObjBuilder b;
-            BSONObjIterator keyIter( key );
-            while ( keyIter.moreWithEOO() ) {
-                BSONElement f = keyIter.next();
-                if ( f.eoo() )
-                    break;
-                b.append( f );
-            }
-            BSONObj o = b.obj();
-            assert( !o.isEmpty() );
-            keys.insert(o);
-            return;
-        }
-        BSONObj arr = arrayElt.embeddedObject();
-        BSONObjIterator arrIter(arr);
-        while ( arrIter.moreWithEOO() ) {
-            BSONElement e = arrIter.next();
-            if ( e.eoo() )
-                break;
-
-            if ( nameWithinArray[ 0 ] != '\0' ) {
-                if ( e.type() != Object )
-                    continue;
-                e = e.embeddedObject().getFieldDotted( nameWithinArray );
-                if ( e.eoo() )
-                    continue;
-            }
-            BSONObjBuilder b;
-            BSONObjIterator keyIter( key );
-            for ( int i = 0; keyIter.moreWithEOO(); ++i ) {
-                BSONElement f = keyIter.next();
-                if ( f.eoo() )
-                    break;
-                if ( i != arrayPos )
-                    b.append( f );
-                else
-                    b.appendAs( e, "" );
-            }
-
-            BSONObj o = b.obj();
-            assert( !o.isEmpty() );
-            keys.insert(o);
-        }
+	if ( keyPattern.objsize() == 0 ) {
+	  out() << keyPattern.toString() << endl;
+	  out() << info.obj().toString() << endl;
+	  assert(false);
+	}
+	mongo::getKeysFromObject( keyPattern, obj, keys );
     }
 
     int nUnindexes = 0;
@@ -754,11 +776,11 @@ assert( !eloc.isNull() );
     }
 
     /* unindex all keys in all indexes for this record. */
-    void  unindexRecord(NamespaceDetails *d, Record *todelete, const DiskLoc& dl) {
+    void  unindexRecord(NamespaceDetails *d, Record *todelete, const DiskLoc& dl, bool noWarn = false) {
         if ( d->nIndexes == 0 ) return;
         BSONObj obj(todelete);
         for ( int i = 0; i < d->nIndexes; i++ ) {
-            _unindexRecord(d->indexes[i], obj, dl);
+            _unindexRecord(d->indexes[i], obj, dl, !noWarn);
         }
     }
 
@@ -811,7 +833,7 @@ assert( !eloc.isNull() );
         }
     }
 
-    void DataFileMgr::deleteRecord(const char *ns, Record *todelete, const DiskLoc& dl, bool cappedOK)
+    void DataFileMgr::deleteRecord(const char *ns, Record *todelete, const DiskLoc& dl, bool cappedOK, bool noWarn)
     {
         dassert( todelete == dl.rec() );
 
@@ -824,7 +846,7 @@ assert( !eloc.isNull() );
         /* check if any cursors point to us.  if so, advance them. */
         aboutToDelete(dl);
 
-        unindexRecord(d, todelete, dl);
+        unindexRecord(d, todelete, dl, noWarn);
 
         _deleteRecord(d, ns, todelete, dl);
         NamespaceDetailsTransient::get( ns ).registerWriteOp();
@@ -1011,6 +1033,7 @@ assert( !eloc.isNull() );
        done eventually */
     void addExistingToIndex(const char *ns, NamespaceDetails *d, IndexDetails& idx, int idxNo) {
         bool dupsAllowed = !idx.unique();
+        bool dropDups = idx.dropDups();
 
         Timer t;
         Nullstream& l = log();
@@ -1022,12 +1045,18 @@ assert( !eloc.isNull() );
             BSONObj js = c->current();
             try { 
                 _indexRecord(d, idxNo, js, c->currLoc(),dupsAllowed);
+                c->advance();
             } catch( AssertionException& e ) { 
-                l << endl;
-                log(2) << "addExistingToIndex exception " << e.what() << endl;
-                throw;
+                if ( dropDups ) {
+                    DiskLoc toDelete = c->currLoc();
+                    c->advance();
+                    theDataFileMgr.deleteRecord( ns, toDelete.rec(), toDelete, false, true );
+                } else {
+                    l << endl;
+                    log(2) << "addExistingToIndex exception " << e.what() << endl;
+                    throw;
+                }
             }
-            c->advance();
             n++;
         };
         l << "done for " << n << " records";
@@ -1111,28 +1140,29 @@ assert( !eloc.isNull() );
     } idToInsert;
 #pragma pack()
     
-    void DataFileMgr::insertAndLog( const char *ns, const BSONObj &o ) {
+    void DataFileMgr::insertAndLog( const char *ns, const BSONObj &o, bool god ) {
         BSONObj tmp = o;
-        insert( ns, tmp );
+        insert( ns, tmp, god );
         logOp( "i", ns, tmp );
     }
     
-    DiskLoc DataFileMgr::insert(const char *ns, BSONObj &o) {
-        DiskLoc loc = insert( ns, o.objdata(), o.objsize() );
+    DiskLoc DataFileMgr::insert(const char *ns, BSONObj &o, bool god) {
+        DiskLoc loc = insert( ns, o.objdata(), o.objsize(), god );
         if ( !loc.isNull() )
             o = BSONObj( loc.rec() );
         return loc;
     }
 
-    DiskLoc DataFileMgr::insert(const char *ns, const void *obuf, int len, bool god, const BSONElement &writeId) {
-        bool addIndex = false;
+    DiskLoc DataFileMgr::insert(const char *ns, const void *obuf, int len, bool god, const BSONElement &writeId, bool mayAddIndex) {
+        bool wouldAddIndex = false;
+        uassert("cannot insert into reserved $ collection", god || strchr(ns, '$') == 0 );
         const char *sys = strstr(ns, "system.");
         if ( sys ) {
             uassert("attempt to insert in reserved database name 'system'", sys != ns);
             if ( strstr(ns, ".system.") ) {
                 // later:check for dba-type permissions here if have that at some point separate
-                if ( strstr(ns, ".system.indexes") )
-                    addIndex = true;
+                if ( strstr(ns, ".system.indexes" ) )
+                    wouldAddIndex = true;
                 else if ( strstr(ns, ".system.users") )
                     ;
                 else if ( !god ) {
@@ -1143,6 +1173,8 @@ assert( !eloc.isNull() );
             else
                 sys = 0;
         }
+
+        bool addIndex = wouldAddIndex && mayAddIndex;
 
         NamespaceDetails *d = nsdetails(ns);
         if ( d == 0 ) {
@@ -1223,8 +1255,8 @@ assert( !eloc.isNull() );
             */
             BSONObj io((const char *) obuf);
             BSONElement idField = io.getField( "_id" );
-            uassert( "_id cannot not be an array", idField.type() != Array );
-            if( idField.eoo() && !addIndex && strstr(ns, ".local.") == 0 ) {
+            uassert( "_id cannot be an array", idField.type() != Array );
+            if( idField.eoo() && !wouldAddIndex && strstr(ns, ".local.") == 0 ) {
                 addID = len;
                 if ( writeId.eoo() ) {
                     // Very likely we'll add this elt, so little harm in init'ing here.
@@ -1250,9 +1282,18 @@ assert( !eloc.isNull() );
         if ( loc.isNull() ) {
             // out of space
             if ( d->capped == 0 ) { // size capped doesn't grow
-                DEV log() << "allocating new extent for " << ns << " padding:" << d->paddingFactor << endl;
+                log(1) << "allocating new extent for " << ns << " padding:" << d->paddingFactor << " lenWHdr: " << lenWHdr << endl;
                 database->newestFile()->allocExtent(ns, followupExtentSize(len, d->lastExtentSize));
                 loc = d->alloc(ns, lenWHdr, extentLoc);
+                if ( loc.isNull() ){
+                    log() << " alloc failed after allocating new extent.  lenWHdr: " << lenWHdr << " last extent size:" << d->lastExtentSize << "  trying again" << endl;
+                    for ( int zzz=0; zzz<10 && lenWHdr > d->lastExtentSize; zzz++ ){
+                        database->newestFile()->allocExtent(ns, followupExtentSize(len, d->lastExtentSize));
+                        loc = d->alloc(ns, lenWHdr, extentLoc);
+                        if ( ! loc.isNull() )
+                            break;
+                    }
+                }
             }
             if ( loc.isNull() ) {
                 log() << "out of space in datafile " << ns << " capped:" << d->capped << endl;
@@ -1300,7 +1341,7 @@ assert( !eloc.isNull() );
             tableToIndex->addingIndex(tabletoidxns.c_str(), idx);
             try {
                 addExistingToIndex(tabletoidxns.c_str(), tableToIndex, idx, idxNo);
-            } catch( DBException& ) { 
+            } catch( DBException& ) {
                 // roll back this index
                 string name = idx.indexName();
                 BSONObjBuilder b;
@@ -1373,7 +1414,7 @@ assert( !eloc.isNull() );
         return r;
     }
 
-    void DataFileMgr::init(const char *dir) {
+    void DataFileMgr::init(const string& path ) {
         /*	boost::filesystem::path path( dir );
         	path /= "temp.dat";
         	string pathString = path.string();
@@ -1488,7 +1529,7 @@ namespace mongo {
     boost::intmax_t freeSpace() {
 #if !defined(_WIN32)
         struct statvfs info;
-        assert( !statvfs( dbpath, &info ) );
+        assert( !statvfs( dbpath.c_str() , &info ) );
         return boost::intmax_t( info.f_bavail ) * info.f_frsize;
 #else
         return -1;
@@ -1525,7 +1566,8 @@ namespace mongo {
         string reservedPathString = reservedPath.native_directory_string();
         assert( setClient( dbName, reservedPathString.c_str() ) );
 
-        bool res = cloneFrom(localhost.c_str(), errmsg, dbName, /*logForReplication=*/false, /*slaveok*/false, /*replauth*/false);
+        bool res = cloneFrom(localhost.c_str(), errmsg, dbName, 
+            /*logForReplication=*/false, /*slaveok*/false, /*replauth*/false, /*snapshot*/false);
         closeClient( dbName, reservedPathString.c_str() );
 
         if ( !res ) {
@@ -1551,7 +1593,7 @@ namespace mongo {
         return true;
     }
 
-    void _applyOpToDataFiles( const char *database, FileOp &fo, bool afterAllocator, const char *path ) {
+    void _applyOpToDataFiles( const char *database, FileOp &fo, bool afterAllocator, const string& path ) {
         if ( afterAllocator )
             theFileAllocator().waitUntilFinished();
         string c = database;

@@ -63,6 +63,8 @@ public:
             printHelp(cerr);
             return 1;
         }
+        
+        auth();
 
         if ( hasParam( "fields" ) ){
 
@@ -87,7 +89,7 @@ public:
         }
 
 
-        auto_ptr<DBClientCursor> cursor = conn().query( ns.c_str() , getParam( "query" , "" ) , 0 , 0 , fieldsToReturn , Option_SlaveOk );
+        auto_ptr<DBClientCursor> cursor = conn().query( ns.c_str() , ((Query)(getParam( "query" , "" ))).snapshot() , 0 , 0 , fieldsToReturn , Option_SlaveOk | Option_NoCursorTimeout );
 
         if ( csv ){
             for ( vector<string>::iterator i=fields.begin(); i != fields.end(); i++ ){

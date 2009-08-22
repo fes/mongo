@@ -1,4 +1,4 @@
-// namespacedetails.cpp
+// namespace.cpp
 
 /**
 *    Copyright (C) 2008 10gen Inc.
@@ -32,7 +32,7 @@ namespace mongo {
 
     BSONObj idKeyPattern = fromjson("{\"_id\":1}");
 
-    /* deleted lists -- linked lists of deleted records -- tehy are placed in 'buckets' of various sizes
+    /* deleted lists -- linked lists of deleted records -- are placed in 'buckets' of various sizes
        so you can look for a deleterecord about the right size.
     */
     int bucketSizes[] = {
@@ -41,15 +41,15 @@ namespace mongo {
         0x400000, 0x800000
     };
 
-//NamespaceIndexMgr namespaceIndexMgr;
-
     bool NamespaceIndex::exists() const {
-        return !boost::filesystem::exists(path());        
+        return !boost::filesystem::exists(path());
     }
     
     boost::filesystem::path NamespaceIndex::path() const {
         return boost::filesystem::path( dir_ ) / ( database_ + ".ns" );
     }
+
+	int lenForNewNsFiles = 16 * 1024 * 1024;
     
     void NamespaceIndex::init() {
         if ( ht )
@@ -63,14 +63,29 @@ namespace mongo {
             i.dbDropped();
         }
 
-        long LEN = 16 * 1024 * 1024;
-        string pathString = path().string();
-        void *p = f.map(pathString.c_str(), LEN);
+		int len = -1;
+        boost::filesystem::path nsPath = path();
+        string pathString = nsPath.string();
+		void *p;
+        if( boost::filesystem::exists(nsPath) ) { 
+			p = f.map(pathString.c_str());
+			len = f.length();
+			uassert( "bad .ns file length, cannot open database", len % (1024*1024) == 0 );
+		}
+		else {
+			// use lenForNewNsFiles, we are making a new database
+			massert( "bad lenForNewNsFiles", lenForNewNsFiles >= 1024*1024 );
+			long l = lenForNewNsFiles;
+			p = f.map(pathString.c_str(), l);
+			len = (int) l;
+			assert( len == lenForNewNsFiles );
+		}
+
         if ( p == 0 ) {
             problem() << "couldn't open file " << pathString << " terminating" << endl;
-            exit(-3);
+            dbexit( EXIT_FS );
         }
-        ht = new HashTable<Namespace,NamespaceDetails>(p, LEN, "namespace index");
+        ht = new HashTable<Namespace,NamespaceDetails>(p, len, "namespace index");
     }
 
     void NamespaceDetails::addDeletedRec(DeletedRecord *d, DiskLoc dloc) {
@@ -222,9 +237,7 @@ namespace mongo {
     }
 
     void NamespaceDetails::dumpDeleted(set<DiskLoc> *extents) {
-//	out() << "DUMP deleted chains" << endl;
         for ( int i = 0; i < Buckets; i++ ) {
-//		out() << "  bucket " << i << endl;
             DiskLoc dl = deletedList[i];
             while ( !dl.isNull() ) {
                 DeletedRecord *r = dl.drec();
@@ -239,7 +252,6 @@ namespace mongo {
                 dl = r->nextDeleted;
             }
         }
-//	out() << endl;
     }
 
     /* combine adjacent deleted records
@@ -504,7 +516,19 @@ namespace mongo {
         }
         return -1;
     }
-
+    
+    long long NamespaceDetails::storageSize(){
+        Extent * e = firstExtent.ext();
+        assert( e );
+        
+        long long total = 0;
+        while ( e ){
+                total += e->length;
+                e = e->getNextExtent();
+        }
+        return total;
+    }
+    
     /* ------------------------------------------------------------------------- */
 
     map< string, shared_ptr< NamespaceDetailsTransient > > NamespaceDetailsTransient::map_;
@@ -536,9 +560,9 @@ namespace mongo {
         allIndexKeys.clear();
         NamespaceDetails *d = nsdetails(ns.c_str());
         for ( int i = 0; i < d->nIndexes; i++ ) {
-//        set<string> fields;
+			// set<string> fields;
             d->indexes[i].keyPattern().getFieldNames(allIndexKeys);
-//        allIndexKeys.insert(fields.begin(),fields.end());
+			// allIndexKeys.insert(fields.begin(),fields.end());
         }
     }
     
@@ -602,4 +626,68 @@ namespace mongo {
         }
     }
 
+    void renameNamespace( const char *from, const char *to ) {
+		NamespaceIndex *ni = nsindex( from );
+		assert( ni && ni->details( from ) && !ni->details( to ) );
+		
+		// Our namespace and index details will move to a different 
+		// memory location.  The only references to namespace and 
+		// index details across commands are in cursors and nsd
+		// transient (including query cache) so clear these.
+		ClientCursor::invalidate( from );
+		NamespaceDetailsTransient::drop( from );
+		
+		NamespaceDetails *details = ni->details( from );
+		ni->add( to, *details );
+		ni->drop( from );
+		details = ni->details( to );
+		
+		BSONObj oldSpec;
+		char database[MaxClientLen];
+		nsToClient(from, database);
+		string s = database;
+		s += ".system.namespaces";
+		assert( Helpers::findOne( s.c_str(), BSON( "name" << from ), oldSpec ) );
+		
+		BSONObjBuilder newSpecB;
+		BSONObjIterator i( oldSpec.getObjectField( "options" ) );
+		while( i.more() ) {
+			BSONElement e = i.next();
+			if ( strcmp( e.fieldName(), "create" ) != 0 )
+				newSpecB.append( e );
+			else
+				newSpecB << "create" << to;
+		}
+		BSONObj newSpec = newSpecB.done();    
+		addNewNamespaceToCatalog( to, newSpec.isEmpty() ? 0 : &newSpec );
+
+		deleteObjects( s.c_str(), BSON( "name" << from ), false, false, true );
+		// oldSpec variable no longer valid memory
+
+		BSONObj oldIndexSpec;
+		s = database;
+		s += ".system.indexes";
+		while( Helpers::findOne( s.c_str(), BSON( "ns" << from ), oldIndexSpec ) ) {
+			BSONObjBuilder newIndexSpecB;
+			BSONObjIterator i( oldIndexSpec );
+			while( i.more() ) {
+				BSONElement e = i.next();
+				if ( strcmp( e.fieldName(), "ns" ) != 0 )
+					newIndexSpecB.append( e );
+				else
+					newIndexSpecB << "ns" << to;
+			}
+			BSONObj newIndexSpec = newIndexSpecB.done();
+			DiskLoc newIndexSpecLoc = theDataFileMgr.insert( s.c_str(), newIndexSpec.objdata(), newIndexSpec.objsize(), true, BSONElement(), false );
+			int indexI = details->findIndexByName( oldIndexSpec.getStringField( "name" ) );
+			IndexDetails &indexDetails = details->indexes[ indexI ];
+			string oldIndexNs = indexDetails.indexNamespace();
+			indexDetails.info = newIndexSpecLoc;
+			string newIndexNs = indexDetails.indexNamespace();
+			
+			BtreeBucket::renameIndexNamespace( oldIndexNs.c_str(), newIndexNs.c_str() );
+			deleteObjects( s.c_str(), oldIndexSpec.getOwned(), true, false, true );
+		}
+	}
+	
 } // namespace mongo

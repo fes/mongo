@@ -57,9 +57,16 @@ namespace mongo {
         }
         
         BasicMatcher( BSONElement _e , int _op ) : toMatch( _e ) , compareOp( _op ){
+            if ( _op == BSONObj::opMOD ){
+                BSONObj o = _e.embeddedObject().firstElement().embeddedObject();
+                mod = o["0"].numberInt();
+                modm = o["1"].numberInt();
+                
+                uassert( "mod can't be 0" , mod );
+            }
         }
 
-
+        
         BasicMatcher( BSONElement _e , int _op , const BSONObj& array ) : toMatch( _e ) , compareOp( _op ){
             
             myset.reset( new set<BSONElement,element_lt>() );
@@ -74,6 +81,9 @@ namespace mongo {
         BSONElement toMatch;
         int compareOp;
         shared_ptr< set<BSONElement,element_lt> > myset;
+
+        int mod;
+        int modm;
     };
 
 // SQL where clause equivalent

@@ -53,19 +53,26 @@ namespace mongo {
         virtual void printHelp(ostream &out);
 
         virtual void printExtraHelp( ostream & out );
-
+        
     protected:
-        string _name;
 
+        mongo::DBClientBase &conn( bool slaveIfPaired = false );
+        void auth( string db = "" );
+        
+        string _name;
+        
         string _db;
         string _coll;
+        
+        string _username;
+        string _password;
 
-        mongo::DBClientBase &conn() { return _useDirect ? (mongo::DBClientBase&)_direct : (mongo::DBClientBase&)_conn; };
-
+        
     private:
-        mongo::DBClientConnection _conn;
-        mongo::DBDirectClient _direct;
-        bool _useDirect;
+        string _host;
+        mongo::DBClientBase * _conn;
+        bool _paired;
+        
         boost::program_options::options_description * _options;
         boost::program_options::positional_options_description _positonalOptions;
 

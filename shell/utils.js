@@ -10,11 +10,16 @@ friendlyEqual = function( a , b ){
 }
 
 
+doassert = function( msg ){
+    print( "assert: " + msg );
+    throw msg;
+}
+
 assert = function( b , msg ){
     if ( b )
         return;
     
-    throw "assert failed : " + msg;
+    doassert( "assert failed : " + msg );
 }
 
 assert.eq = function( a , b , msg ){
@@ -24,14 +29,14 @@ assert.eq = function( a , b , msg ){
     if ( ( a != null && b != null ) && friendlyEqual( a , b ) )
         return;
 
-    throw "[" + tojson( a ) + "] != [" + tojson( b ) + "] are not equal : " + msg;
+    doassert( "[" + tojson( a ) + "] != [" + tojson( b ) + "] are not equal : " + msg );
 }
 
 assert.neq = function( a , b , msg ){
     if ( a != b )
         return;
 
-    throw "[" + a + "] != [" + b + "] are equal : " + msg;
+    doassert( "[" + a + "] != [" + b + "] are equal : " + msg );
 }
 
 assert.soon = function( f, msg, timeout, interval ) {
@@ -43,7 +48,7 @@ assert.soon = function( f, msg, timeout, interval ) {
         if ( f() )
             return;
         if ( ( new Date() ).getTime() - start.getTime() > timeout )
-            throw "assert.soon failed: " + f + ", msg:" + msg;
+            doassert( "assert.soon failed: " + f + ", msg:" + msg );
         sleep( interval );
     }
 }
@@ -57,40 +62,40 @@ assert.throws = function( func , params , msg ){
         return e;
     }
 
-    throw "did not throw exception: " + msg ;
+    doassert( "did not throw exception: " + msg );
 }
 
 assert.commandWorked = function( res , msg ){
     if ( res.ok == 1 )
         return;
     
-    throw "command failed: " + tojson( res ) + " : " + msg;
+    doassert( "command failed: " + tojson( res ) + " : " + msg );
 }
 
 assert.commandFailed = function( res , msg ){
     if ( res.ok == 0 )
         return;
     
-    throw "command worked when it should have failed: " + tojson( res ) + " : " + msg;
+    doassert( "command worked when it should have failed: " + tojson( res ) + " : " + msg );
 }
 
 assert.isnull = function( what , msg ){
     if ( what == null )
         return;
     
-    throw "supposed to null (" + ( msg || "" ) + ") was: " + tojson( what );
+    doassert( "supposed to null (" + ( msg || "" ) + ") was: " + tojson( what ) );
 }
 
 assert.lt = function( a , b , msg ){
     if ( a < b )
         return;
-    throw a + " is not less than " + b + " : " + msg;
+    doassert( a + " is not less than " + b + " : " + msg );
 }
 
 assert.gt = function( a , b , msg ){
     if ( a > b )
         return;
-    throw a + " is not greater than " + b + " : " + msg;
+    doassert( a + " is not greater than " + b + " : " + msg );
 }
 
 Object.extend = function( dst , src ){
@@ -193,23 +198,33 @@ ObjectId.prototype.tojson = function(){
 
 ObjectId.prototype.isObjectId = true;
 
-DBRef.prototype.fetch = function(){
-    assert( this.ns , "need a ns" );
-    assert( this.id , "need an id" );
+if ( typeof( DBRef ) != "undefined" ){
+    DBRef.prototype.fetch = function(){
+        assert( this.ns , "need a ns" );
+        assert( this.id , "need an id" );
+        
+        return db[ this.ns ].findOne( { _id : this.id } );
+    }
     
-    return db[ this.ns ].findOne( { _id : this.id } );
+    DBRef.prototype.tojson = function(){
+        return "{ 'ns' : \"" + this.ns + "\" , 'id' : \"" + this.id + "\" } ";
+    }
+    
+    DBRef.prototype.toString = function(){
+        return "DBRef " + this.ns + ":" + this.id;
+    }
+}
+else {
+    print( "warning: no DBRef" );
 }
 
-DBRef.prototype.tojson = function(){
-    return "{ 'ns' : \"" + this.ns + "\" , 'id' : \"" + this.id + "\" } ";
+if ( typeof( BinData ) != "undefined" ){
+    BinData.prototype.tojson = function(){
+        return "BinData type: " + this.type + " len: " + this.len;
+    }
 }
-
-DBRef.prototype.toString = function(){
-    return "DBRef " + this.ns + ":" + this.id;
-}
-
-BinData.prototype.tojson = function(){
-    return "BinData type: " + this.type + " len: " + this.len;
+else {
+    print( "warning: no BinData" );
 }
 
 tojson = function( x ){
@@ -256,6 +271,11 @@ tojsonObject = function( x ){
     if ( typeof( x.tojson ) == "function" && x.tojson != tojson )
         return x.tojson();
 
+    if ( x.toString() == "[object MaxKey]" )
+        return "{ $maxKey : 1 }";
+    if ( x.toString() == "[object MinKey]" )
+        return "{ $minKey : 1 }";
+    
     var s = "{";
     
     var first = true;
@@ -296,9 +316,17 @@ printjson = function(x){
 }
 
 shellPrintHelper = function( x ){
-    
-    if ( typeof( x ) == "undefined" )
+
+    if ( typeof( x ) == "undefined" ){
+
+        if ( typeof( db ) != "undefined" && db.getLastError ){
+            var e = db.getLastError();
+            if ( e != null )
+                print( e );
+        }
+
         return;
+    }
     
     if ( x == null ){
         print( "null" );
@@ -334,6 +362,8 @@ shellHelper = function( command , rest , shouldPrint ){
 }
 
 help = shellHelper.help = function(){
+    if ( typeof( db ) != "undefined" )
+        print( "server version: " + db.version() );
     print( "HELP" );
     print( "\t" + "show dbs                     show database names");
     print( "\t" + "show collections             show collections in current database");
@@ -397,8 +427,29 @@ shellHelper.show = function( what ){
 
 if ( typeof( Map ) == "undefined" ){
     Map = function(){
-        this._data = [];
+        this._data = {};
     }
+}
+
+Map.hash = function( val ){
+    if ( ! val )
+        return val;
+
+    switch ( typeof( val ) ){
+    case 'string':
+    case 'number':
+    case 'date':
+        return val.toString();
+    case 'object':
+    case 'array':
+        var s = "";
+        for ( var k in val ){
+            s += k + val[k];
+        }
+        return s;
+    }
+
+    throw "can't hash : " + typeof( val );
 }
 
 Map.prototype.put = function( key , value ){
@@ -413,18 +464,29 @@ Map.prototype.get = function( key ){
 }
 
 Map.prototype._get = function( key ){
-    for ( var i=0; i<this._data.length; i++ ){
-        if ( friendlyEqual( key , this._data[i].key ) ){
-            return this._data[i];
+    var h = Map.hash( key );
+    var a = this._data[h];
+    if ( ! a ){
+        a = [];
+        this._data[h] = a;
+    }
+    
+    for ( var i=0; i<a.length; i++ ){
+        if ( friendlyEqual( key , a[i].key ) ){
+            return a[i];
         }
     }
     var o = { key : key , value : null };
-    this._data.push( o );
+    a.push( o );
     return o;
 }
 
 Map.prototype.values = function(){
-    return this._data.map( function(z){ return z.value } );
+    var all = [];
+    for ( var k in this._data ){
+        this._data[k].forEach( function(z){ all.push( z.value ); } );
+    }
+    return all;
 }
 
 Math.sigFig = function( x , N ){
@@ -434,3 +496,4 @@ Math.sigFig = function( x , N ){
     var p = Math.pow( 10, N - Math.ceil( Math.log( Math.abs(x) ) / Math.log( 10 )) );
     return Math.round(x*p)/p;
 }
+

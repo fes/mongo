@@ -150,6 +150,12 @@ AddOption( "--boost-compiler",
            action="store",
            help="compiler used for boost (gcc41)" )
 
+AddOption( "--pg",
+           dest="profile",
+           type="string",
+           nargs=0,
+           action="store" )
+
 # --- environment setup ---
 
 def removeIfInList( lst , thing ):
@@ -466,6 +472,9 @@ elif "win32" == os.sys.platform:
     else:
         env.Append( CPPDEFINES=["_X86_=1"] )
 
+    env.Append( CPPPATH=["../winpcap/Include"] )
+    env.Append( LIBPATH=["../winpcap/Lib"] )
+
 else:
     print( "No special config for [" + os.sys.platform + "] which probably means it won't work" )
 
@@ -503,6 +512,13 @@ if nix:
         env.Append( CXXFLAGS="-m32" )
         env.Append( LINKFLAGS="-m32" )
 
+    if GetOption( "profile" ) is not None:
+        env.Append( LINKFLAGS=" -pg " )
+
+try:
+    umask = os.umask(022)
+except OSError:
+    pass
 
 # --- check system ---
 
@@ -623,6 +639,9 @@ def doConfigure( myenv , needJava=True , needPcre=True , shell=False ):
     # this will add it iff it exists and works
     myCheckLib( "boost_system" + boostCompiler + "-mt" )
 
+    if not conf.CheckCXXHeader( "execinfo.h" ):
+        myenv.Append( CPPDEFINES=[ "NOEXECINFO" ] )
+
     if needJava:
         for j in javaLibs:
             myCheckLib( j , True , True )
@@ -631,8 +650,9 @@ def doConfigure( myenv , needJava=True , needPcre=True , shell=False ):
         myCheckLib( "pcrecpp" , True )
         myCheckLib( "pcre" , True )
 
-    myenv["_HAVEPCAP"] = myCheckLib( "pcap" )
+    myenv["_HAVEPCAP"] = myCheckLib( ["pcap", "wpcap"] )
     removeIfInList( myenv["LIBS"] , "pcap" )
+    removeIfInList( myenv["LIBS"] , "wpcap" )
 
     # this is outside of usesm block so don't have to rebuild for java
     if windows:
@@ -800,7 +820,10 @@ mongosniff_built = False
 if darwin or clientEnv["_HAVEPCAP"]:
     mongosniff_built = True
     sniffEnv = clientEnv.Clone()
-    sniffEnv.Append( LIBS=[ "pcap" ] )
+    if not windows:
+        sniffEnv.Append( LIBS=[ "pcap" ] )
+    else:
+        sniffEnv.Append( LIBS=[ "wpcap" ] )
     sniffEnv.Program( "mongosniff" , "tools/sniffer.cpp" )
 
 # --- shell ---
@@ -849,7 +872,7 @@ elif not onlyServer:
 
         shellEnv.VariantDir( "32bit" , "." )
     else:
-        shellEnv.Append( LIBPATH=[ "." ] )
+        shellEnv.Prepend( LIBPATH=[ "." ] )
 
     shellEnv = doConfigure( shellEnv , needPcre=False , needJava=False , shell=True )
 
@@ -858,6 +881,9 @@ elif not onlyServer:
     else:
         shellEnv.Prepend( LIBS=[ "mongoclient"] )
         mongo = shellEnv.Program( "mongo" , coreShellFiles )
+
+    if weird:
+        Depends( "32bit/shell/mongo.cpp" , "shell/mongo.cpp" )
 
 
 #  ---- RUNNING TESTS ----
@@ -1114,6 +1140,15 @@ addSmoketest( "recordPerf", [ "perftest" ] , [ recordPerformance ] )
 
 #  ----  INSTALL -------
 
+def getSystemInstallName():
+    n = platform + "-" + processor
+    if static:
+        n += "-static"
+    if nix and os.uname()[2].startswith( "8." ):
+        n += "-tiger"
+    return n
+
+
 def getCodeVersion():
     fullSource = open( "stdafx.cpp" , "r" ).read()
     allMatches = re.findall( r"versionString.. = \"(.*?)\"" , fullSource );
@@ -1142,9 +1177,7 @@ def getDistName( sofar ):
 if distBuild:
     from datetime import date
     today = date.today()
-    installDir = "mongodb-" + platform + "-" + processor + "-"
-    if static:
-        installDir += "static-"
+    installDir = "mongodb-" + getSystemInstallName() + "-"
     installDir += getDistName( installDir )
     print "going to make dist: " + installDir
 
@@ -1176,6 +1209,9 @@ def installBinary( e , name ):
 
     if linux and len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) == "s3dist":
         e.AddPostAction( inst , checkGlibc )
+
+    if nix:
+        e.AddPostAction( inst , e.Action( 'chmod 755 ' + fullInstallName ) )
 
 installBinary( env , "mongodump" )
 installBinary( env , "mongorestore" )
@@ -1265,9 +1301,7 @@ def s3push( localName , remoteName=None , remotePrefix=None , fixName=True , pla
 
     if fixName:
         (root,dot,suffix) = localName.rpartition( "." )
-        name = remoteName + "-" + platform + "-" + processor
-        if static:
-            name += "-static"
+        name = remoteName + "-" + getSystemInstallName()
         name += remotePrefix
         if dot == "." :
             name += "." + suffix
@@ -1322,3 +1356,10 @@ def clean_old_dist_builds(env, target, source):
 env.Alias("dist_clean", [], [clean_old_dist_builds])
 env.AlwaysBuild("dist_clean")
 
+from buildscripts import test_shell
+def run_shell_tests(env, target, source):
+    test_shell.mongo_path = windows and "mongo.exe" or "mongo"
+    test_shell.run_tests()
+
+env.Alias("test_shell", [], [run_shell_tests])
+env.AlwaysBuild("test_shell")

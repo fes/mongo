@@ -42,6 +42,12 @@ DB.prototype.runCommand = function( obj ){
 
 DB.prototype._dbCommand = DB.prototype.runCommand;
 
+DB.prototype._adminCommand = function( obj ){
+    if ( this._name == "admin" )
+        return this.runCommand( obj );
+    return this.getSisterDB( "admin" ).runCommand( obj );
+}
+
 DB.prototype.addUser = function( username , pass ){
     var c = this.getCollection( "system.users" );
     
@@ -128,8 +134,9 @@ DB.prototype.dropDatabase = function() {
 
 
 DB.prototype.shutdownServer = function() { 
-    if( "admin" != db )
+    if( "admin" != this._name ){
 	return "shutdown command only works with the admin database; try 'use admin'";
+    }
 
     try {
         this._dbCommand("shutdown");
@@ -215,7 +222,7 @@ DB.prototype.copyDatabase = function(fromdb, todb, fromhost) {
     assert( isString(todb) && todb.length );
     fromhost = fromhost || "";
     //this.resetIndexCache();
-    return this._dbCommand( { copydb:1, fromhost:fromhost, fromdb:fromdb, todb:todb } );
+    return this._adminCommand( { copydb:1, fromhost:fromhost, fromdb:fromdb, todb:todb } );
 }
 
 /**
@@ -232,6 +239,7 @@ DB.prototype.help = function() {
     print("DB methods:");
     print("\tdb.auth(username, password)");
     print("\tdb.getMongo() get the server connection object");
+	print("\tdb.getMongo().setSlaveOk() allow this connection to read from the nonmaster member of a replica pair");
     print("\tdb.getSisterDB(name) get the db at the same server as this onew");
     print("\tdb.getName()");
     print("\tdb.getCollection(cname) same as db['cname'] or db.cname");
@@ -254,6 +262,9 @@ DB.prototype.help = function() {
     print("\tdb.resetError()");
     print("\tdb.getCollectionNames()");
     print("\tdb.group(ns, key[, keyf], cond, reduce, initial)");
+    print("\tdb.currentOp() displays the current operation in the db" );
+    print("\tdb.killOp() kills the current operation in the db" );
+    print("\tdb.version() current version of the server" );
 }
 
 /**
@@ -363,17 +374,22 @@ DB.prototype.group = function(parmsObj) {
 	var parms = args[0];
     	var c = db[parms.ns].find(parms.cond||{});
     	var map = new Map();
+        var pks = parms.key ? parms.key.keySet() : null;
+        var pkl = pks ? pks.length : 0;
+        var key = {};
         
     	while( c.hasNext() ) {
 	    var obj = c.next();
-	    var key = {};
-	    if( parms.key ) {
-	    	for( var i in parms.key )
-		    key[i] = obj[i];
+	    if ( pks ) {
+	    	for( var i=0; i<pkl; i++ ){
+                    var k = pks[i];
+		    key[k] = obj[k];
+                }
 	    }
 	    else {
 	    	key = parms.$keyf(obj);
 	    }
+
 	    var aggObj = map.get(key);
 	    if( aggObj == null ) {
 		var newObj = Object.extend({}, key); // clone
@@ -386,6 +402,18 @@ DB.prototype.group = function(parmsObj) {
 	return map.values();
     }
     
+    return this.eval(groupFunction, this._groupFixParms( parmsObj ));
+}
+
+DB.prototype.groupcmd = function( parmsObj ){
+    var ret = this.runCommand( { "group" : this._groupFixParms( parmsObj ) } );
+    if ( ! ret.ok ){
+        throw "group command failed: " + tojson( ret );
+    }
+    return ret.retval;
+}
+
+DB.prototype._groupFixParms = function( parmsObj ){
     var parms = Object.extend({}, parmsObj);
     
     if( parms.reduce ) {
@@ -398,7 +426,7 @@ DB.prototype.group = function(parmsObj) {
 	delete parms.keyf;
     }
     
-    return this.eval(groupFunction, parms);
+    return parms;
 }
 
 DB.prototype.resetError = function(){
@@ -519,4 +547,12 @@ DB.prototype.getReplicationInfo = function() {
     }
 
     return result;
+}
+
+DB.prototype.serverBuildInfo = function(){
+    return this._adminCommand( "buildinfo" );
+}
+
+DB.prototype.version = function(){
+    return this.serverBuildInfo().version;
 }

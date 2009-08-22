@@ -44,9 +44,10 @@ DBCollection.prototype.help = function(){
     print("\tdb.foo.getIndexes()");
     print("\tdb.foo.drop() drop the collection");
     print("\tdb.foo.validate() - SLOW");
-    print("\tdb.foo.stats() - stats about the collection - SLOW");
-    print("\tdb.foo.dataSize() - size in bytes of all the data - SLOW");
-    print("\tdb.foo.totalIndexSize() - size in bytes of all the indexes - SLOW");
+    print("\tdb.foo.stats()");
+    print("\tdb.foo.dataSize()");
+    print("\tdb.foo.storageSize() - includes free space allocated to this collection");
+    print("\tdb.foo.totalIndexSize() - size in bytes of all the indexes");
 }
 
 DBCollection.prototype.getFullName = function(){
@@ -92,6 +93,8 @@ DBCollection.prototype._validateObject = function( o ){
         throw "can't save a DBQuery object";
 }
 
+DBCollection._allowedFields = { $id : 1 , $ref : 1 };
+
 DBCollection.prototype._validateForStorage = function( o ){
     this._validateObject( o );
     for ( var k in o ){
@@ -99,8 +102,8 @@ DBCollection.prototype._validateForStorage = function( o ){
             throw "can't have . in field names [" + k + "]" ;
         }
 
-        if ( k.indexOf( "$" ) == 0 ) {
-            throw "field names cannot start with $ [" + k + "]" ;
+        if ( k.indexOf( "$" ) == 0 && ! DBCollection._allowedFields[k] ) {
+            throw "field names cannot start with $ [" + k + "]";
         }
 
         if ( o[k] !== null && typeof( o[k] ) === "object" ) {
@@ -172,7 +175,7 @@ DBCollection.prototype._genIndexName = function( keys ){
 
 DBCollection.prototype._indexSpec = function( keys, options ) {
     var name;
-    var unique = false;
+    var nTrue = 0;
     if ( !isObject( options ) ) {
         options = [ options ];
     }
@@ -181,13 +184,18 @@ DBCollection.prototype._indexSpec = function( keys, options ) {
         if ( isString( o ) ) {
             name = o;
         } else if ( typeof( o ) == "boolean" ) {
-            unique = o;
+	    if ( o ) {
+		++nTrue;
+	    }
         }
     }
     name = name || this._genIndexName( keys );
     var ret = { ns : this._fullName , key : keys , name : name };
-    if ( unique == true ) {
-        ret.unique = true;
+    if ( nTrue > 0 ) {
+	ret.unique = true;
+    }
+    if ( nTrue > 1 ) {
+	ret.dropDups = true;
     }
     return ret;
 }
@@ -205,7 +213,9 @@ DBCollection.prototype.ensureIndex = function( keys , options ){
     }
 
     this.createIndex( keys , options );
-    this._indexCache[name] = true;
+    if ( this.getDB().getLastError() == "" ) {
+	this._indexCache[name] = true;
+    }
     return true;
 }
 
@@ -338,19 +348,15 @@ DBCollection.prototype.getCollection = function( subName ){
 }
 
 DBCollection.prototype.stats = function(){
-    var res = this.validate().result;
-    var p = /\b(\w+)\??: *(\d+)\b/g;
-    var m;
-
-    var o = {};
-    while ( m = p.exec( res ) ){
-        o[ m[1] ] = m[2];
-    }
-    return o;
+    return this._db.runCommand( { collstats : this._shortName } );
 }
 
 DBCollection.prototype.dataSize = function(){
-    return parseInt( this.stats().datasize );
+    return this.stats().size;
+}
+
+DBCollection.prototype.storageSize = function(){
+    return this.stats().storageSize;
 }
 
 DBCollection.prototype.totalIndexSize = function(){
@@ -386,6 +392,11 @@ DBCollection.prototype.isCapped = function(){
 DBCollection.prototype.group = function( params ){
     params.ns = this._shortName;
     return this._db.group( params );
+}
+
+DBCollection.prototype.groupcmd = function( params ){
+    params.ns = this._shortName;
+    return this._db.groupcmd( params );
 }
 
 DBCollection.prototype.toString = function(){

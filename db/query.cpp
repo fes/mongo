@@ -106,16 +106,22 @@ namespace mongo {
        justOne: stop after 1 match
     */
     int deleteObjects(const char *ns, BSONObj pattern, bool justOne, bool logop, bool god) {
-        if ( strstr(ns, ".system.") && !god ) {
-            /* note a delete from system.indexes would corrupt the db 
-               if done here, as there are pointers into those objects in 
-               NamespaceDetails.
-            */
-            if( strstr(ns, ".system.users") )
-                ;
-            else {
-                out() << "ERROR: attempt to delete in system namespace " << ns << endl;
-                return -1;
+        if( !god ) {
+            if ( strstr(ns, ".system.") ) {
+                /* note a delete from system.indexes would corrupt the db 
+                if done here, as there are pointers into those objects in 
+                NamespaceDetails.
+                */
+                if( strstr(ns, ".system.users") )
+                    ;
+                else {
+                    uasserted("cannot delete from system namespace");
+                    return -1;
+                }
+            }
+            if ( strchr( ns , '$' ) ){
+                log() << "cannot delete from collection with reserved $ in name: " << ns << endl;
+                uassert( "cannot delete from collection with reserved $ in name", strchr(ns, '$') == 0 );
             }
         }
 
@@ -228,12 +234,16 @@ namespace mongo {
         vector< shared_ptr< BSONObjBuilder > > builderStorage_;
     };
     
+    /* Used for modifiers such as $inc, $set, ... */
     struct Mod {
         enum Op { INC, SET, PUSH, PUSH_ALL, PULL, PULL_ALL } op;
         const char *fieldName;
+
+        // kind of lame; fix one day?
         double *ndouble;
         int *nint;
         long long *nlong;
+/*
         BSONElement elt;
         int pushStartSize;
         void setn(double n) const {
@@ -243,6 +253,39 @@ namespace mongo {
         }
         double getn() const {
             return ndouble ? *ndouble : nlong ? *nlong : *nint;
+						*/
+
+        BSONElement elt;
+        int pushStartSize;
+
+        /* [dm] why is this const? (or rather, why was setn const?)  i see why but think maybe clearer if were not.  */
+        void inc(BSONElement& n) const { 
+            uassert( "$inc value is not a number", n.isNumber() );
+            if( ndouble ) 
+                *ndouble += n.numberDouble();
+            else if( nint )
+                *nint += n.numberInt();
+            else
+                *nlong += n.numberLong();\
+        }
+
+        void setElementToOurNumericValue(BSONElement& e) const { 
+            BSONElementManipulator manip(e);
+            if( e.type() == NumberLong )
+                manip.setLong(_getlong());
+            else
+                manip.setNumber(_getn());
+        }
+
+        double _getn() const {
+            if( ndouble ) return *ndouble;
+            if( nint ) return *nint;
+            return (double) *nlong;
+        }
+        long long _getlong() const {
+            if( nlong ) return *nlong; 
+            if( ndouble ) return (long long) *ndouble;
+            return *nint;
         }
         bool operator<( const Mod &other ) const {
             return strcmp( fieldName, other.fieldName ) < 0;
@@ -417,13 +460,16 @@ namespace mongo {
             BSONElement e = obj.getFieldDotted(m.fieldName);
             if ( m.op == Mod::PULL || m.op == Mod::PULL_ALL )
                 continue;
+
+            // [dm] the BSONElementManipulator statements below are for replication (correct?)
             if ( m.op == Mod::INC ) {
-                m.setn( e.number() + m.getn() );
-                BSONElementManipulator( e ).setNumber( m.getn() );
+                m.inc(e);
+                m.setElementToOurNumericValue(e);
             } else {
-                if ( e.isNumber() && m.elt.isNumber() )
-                    BSONElementManipulator( e ).setNumber( m.getn() );
-                else
+                if ( e.isNumber() && m.elt.isNumber() ) {
+                    // todo: handle NumberLong:
+                    m.setElementToOurNumericValue(e);
+                } else
                     BSONElementManipulator( e ).replaceTypeAndValue( m.elt );
             }
         }
@@ -477,7 +523,8 @@ namespace mongo {
             if ( cmp == 0 ) {
                 BSONElement e = p->second;
                 if ( m->op == Mod::INC ) {
-                    m->setn( m->getn() + e.number() );
+                    m->inc(e);
+                    //m->setn( m->getn() + e.number() );
                     b2.appendAs( m->elt, m->fieldName );
                 } else if ( m->op == Mod::SET ) {
                     b2.appendAs( m->elt, m->fieldName );
@@ -606,6 +653,8 @@ namespace mongo {
                 uassert( "Modifier $inc allowed for numbers only", f.isNumber() || op != Mod::INC );
                 uassert( "Modifier $pushAll/pullAll allowed for arrays only", f.type() == Array || ( op != Mod::PUSH_ALL && op != Mod::PULL_ALL ) );
                 m.elt = f;
+
+                // horrible - to be cleaned up
                 if ( f.type() == NumberDouble ) {
                     m.ndouble = (double *) f.value();
                     m.nint = 0;
@@ -618,6 +667,11 @@ namespace mongo {
                     m.ndouble = 0;
                     m.nint = 0;
                     m.nlong = (long long*) f.value();
+                }
+                else if( f.type() == NumberLong ) { 
+                    m.ndouble = 0;
+                    m.nint = 0;
+                    m.nlong = (long long *) f.value();
                 }
                 mods_.push_back( m );
             }
@@ -672,14 +726,9 @@ namespace mongo {
     int __updateObjects(const char *ns, BSONObj updateobj, BSONObj &pattern, bool upsert, stringstream& ss, bool logop=false) {
         int profile = database->profile;
         
+        uassert("cannot update reserved $ collection", strchr(ns, '$') == 0 );
         if ( strstr(ns, ".system.") ) {
-            if( strstr(ns, ".system.users") )
-                ;
-            else {
-                out() << "\nERROR: attempt to update in system namespace " << ns << endl;
-                ss << " can't update system namespace ";
-                return 0;
-            }
+            uassert("cannot update system collection", strstr(ns, ".system.users"));
         }
         
         QueryPlanSet qps( ns, pattern, BSONObj() );
@@ -1272,8 +1321,9 @@ namespace mongo {
         int ntoskip = q.ntoskip;
         int _ntoreturn = q.ntoreturn;
         BSONObj jsobj = q.query;
-        auto_ptr< FieldMatcher > filter = q.fields;
+        auto_ptr< FieldMatcher > filter = q.fields; // what fields to return (unspecified = full object)
         int queryOptions = q.queryOptions;
+        BSONObj snapshotHint;
         
         Timer t;
         log(2) << "runQuery: " << ns << jsobj << endl;
@@ -1322,8 +1372,12 @@ namespace mongo {
             
             AuthenticationInfo *ai = authInfo.get();
             uassert("unauthorized", ai->isAuthorized(database->name.c_str()));
-            
-            uassert( "not master", isMaster() || (queryOptions & Option_SlaveOk) );
+
+			/* we allow queries to SimpleSlave's -- but not to the slave (nonmaster) member of a replica pair 
+			   so that queries to a pair are realtime consistent as much as possible.  use setSlaveOk() to 
+			   query the nonmaster member of a replica pair.
+			*/
+            uassert( "not master", isMaster() || (queryOptions & Option_SlaveOk) || slave == SimpleSlave );
 
             BSONElement hint;
             BSONObj min;
@@ -1364,7 +1418,25 @@ namespace mongo {
                 snapshot = !e.eoo() && e.trueValue();
                 if( snapshot ) { 
                     uassert("E12001 can't sort with $snapshot", order.isEmpty());
-                    uasserted("code not finished");
+					uassert("E12002 can't use hint with $snapshot", hint.eoo());
+                    NamespaceDetails *d = nsdetails(ns);
+                    if ( d ){
+                        int i = d->findIdIndex();
+                        if( i < 0 ) { 
+                            if ( strstr( ns , ".system." ) == 0 )
+                                log() << "warning: no _id index on $snapshot query, ns:" << ns << endl;
+                        }
+                        else {
+                            /* [dm] the name of an _id index tends to vary, so we build the hint the hard way here.
+                               probably need a better way to specify "use the _id index" as a hint.  if someone is
+                               in the query optimizer please fix this then!
+                            */
+                            BSONObjBuilder b;
+                            b.append("$hint", d->indexes[i].indexName());
+                            snapshotHint = b.obj();
+                            hint = snapshotHint.firstElement();
+                        }
+                    }
                 }
             }
             
@@ -1398,6 +1470,8 @@ namespace mongo {
             log( 5 ) << "   used cursor: " << c->toString() << endl;
             if ( dqo.saveClientCursor() ) {
                 ClientCursor *cc = new ClientCursor();
+                if ( queryOptions & Option_NoCursorTimeout )
+                    cc->liveForever();
                 cc->c = c;
                 cursorid = cc->cursorid;
                 DEV out() << "  query has more, cursorid: " << cursorid << endl;

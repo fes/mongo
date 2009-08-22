@@ -43,7 +43,9 @@ namespace mongo {
         
         Option_OplogReplay = 1 << 3,
 
-        Option_ALLMASK = ( 1 << 4 ) - 2
+        /** if there is a cursor, ignore the normal cursor timeout behavior and never time it out
+         */
+        Option_NoCursorTimeout = 1 << 4
     };
 
     class BSONObj;
@@ -102,6 +104,16 @@ namespace mongo {
         */
         Query& explain();
 
+        /** Use snapshot mode for the query.  Snapshot mode assures no duplicates are returned, or objects missed, which were 
+            present at both the start and end of the query's execution (if an object is new during the query, or deleted during 
+            the query, it may or may not be returned, even with snapshot mode).
+
+            Note that short query responses (less than 1MB) are always effectively snapshotted.
+
+            Currently, snapshot mode may not be used with sorting or explicit hints.
+        */
+        Query& snapshot();
+
         /** Queries to the Mongo database support a $where parameter option which contains 
             a javascript function that is evaluated to see whether objects being queried match 
             its criteria.  Use this helper to append such a function to a query object. 
@@ -120,7 +132,6 @@ namespace mongo {
         */
         Query& where(const string &jscode, BSONObj scope);
         Query& where(const string &jscode) { return where(jscode, BSONObj()); }
-        
 
         /**
          * if this query has an orderby, hint, or some other field
@@ -379,7 +390,7 @@ namespace mongo {
         virtual bool dropCollection( const string &ns ){
             string db = nsGetDB( ns );
             string coll = nsGetCollection( ns );
-            assert( coll.size() );
+            uassert( "no collection name", coll.size() );
 
             BSONObj info;
             
@@ -480,6 +491,16 @@ namespace mongo {
             return true;
         }
         
+        /**
+           get a list of all the current databases
+         */
+        list<string> getDatabaseNames();
+
+        /**
+           get a list of all the current collections in db
+         */
+        list<string> getCollectionNames( const string& db );
+
         virtual string toString() = 0;
 
         /** @return the database name portion of an ns string */
@@ -725,11 +746,7 @@ namespace mongo {
         /** Connect to a server pair using a host pair string of the form
               hostname[:port],hostname[:port]
               */
-        bool connect(string hostpairstring) { 
-            uassert("bad hostpairstring", hostpairstring.find(',') != string::npos);
-            massert("not yet implemented", false);
-            return false;
-        }
+        bool connect(string hostpairstring);
 
         /** Authorize.  Authorizes both sides of the pair as needed. 
         */
@@ -772,10 +789,12 @@ namespace mongo {
         void isntMaster() {
             master = ( ( master == Left ) ? NotSetR : NotSetL );
         }
-
+        
         string getServerAddress() const {
             return left.getServerAddress() + "," + right.getServerAddress();
         }
+
+        DBClientConnection& slaveConn();
 
         /* TODO - not yet implemented. mongos may need these. */
         virtual bool call( Message &toSend, Message &response, bool assertOk=true ) { assert(false); return false; }

@@ -27,6 +27,7 @@
 #include "dbmessage.h"
 #include "instance.h"
 #include "clientcursor.h"
+#include "pdfile.h"
 #if !defined(_WIN32)
 #include <sys/file.h>
 #endif
@@ -60,6 +61,7 @@ namespace mongo {
     extern int opLogging;
     extern long long oplogSize;
     extern OpLog _oplog;
+	extern int lenForNewNsFiles;
 
     extern int ctr;
     extern int callDepth;
@@ -214,7 +216,7 @@ namespace mongo {
                         dbMsgPort.shutdown();
                         sleepmillis(50);
                         problem() << "exiting end msg" << endl;
-                        exit(EXIT_SUCCESS);
+                        dbexit(EXIT_CLEAN);
                     }
                     else {
                         out() << "  (not from localhost, ignoring end msg)" << endl;
@@ -236,12 +238,16 @@ namespace mongo {
         }
         catch ( std::exception &e ) {
             problem() << "Uncaught std::exception: " << e.what() << ", terminating" << endl;
-            exit( 15 );
+            dbexit( EXIT_UNCAUGHT );
         }
         catch ( ... ) {
             problem() << "Uncaught exception, terminating" << endl;
-            exit( 15 );
+            dbexit( EXIT_UNCAUGHT );
         }
+
+        // any thread cleanup can happen here
+        
+        globalScriptEngine->threadDone();
     }
 
 
@@ -332,6 +338,15 @@ namespace mongo {
         }
     }
 
+    void show_32_warning(){
+        if ( sizeof(int*) != 4 )
+            return;
+        cout << endl;
+        cout << "** NOTE: when using MongoDB 32 bit, you are limited to about 2 gigabytes of data" << endl;
+        cout << "**       see http://blog.mongodb.org/post/137788967/32-bit-limitations for more" << endl;
+        cout << endl;
+    }
+
     Timer startupSrandTimer;
 
     void _initAndListen(int listenPort, const char *appserverLoc = null) {
@@ -343,8 +358,12 @@ namespace mongo {
         int pid=0;
 #endif
 
+        bool is32bit = sizeof(int*) == 4;
+
         log() << "Mongo DB : starting : pid = " << pid << " port = " << port << " dbpath = " << dbpath
-              <<  " master = " << master << " slave = " << slave << "  " << ( ( sizeof(int*) == 4 ) ? "32" : "64" ) << "-bit " << endl;
+              <<  " master = " << master << " slave = " << (int) slave << "  " << ( is32bit ? "32" : "64" ) << "-bit " << endl;
+
+        show_32_warning();
 
         stringstream ss;
         ss << "dbpath (" << dbpath << ") does not exist";
@@ -391,7 +410,7 @@ namespace mongo {
         try { _initAndListen(listenPort, appserverLoc); }
         catch(...) {
             log() << " exception in initAndListen, terminating" << endl;
-            dbexit(1);
+            dbexit( EXIT_UNCAUGHT );
         }
     }
 
@@ -412,8 +431,9 @@ using namespace mongo;
 
 namespace po = boost::program_options;
 
+
 void show_help_text(po::options_description options) {
-    cout << "To run mongod with the default options use 'mongod run'." << endl << endl;
+    show_32_warning();
     cout << options << endl;
 };
 
@@ -463,6 +483,8 @@ int main(int argc, char* argv[], char *envp[] )
         ("nohints", "ignore query hints")
         ("nohttpinterface", "disable http interface")
         ("noscripting", "disable scripting engine")
+        ("noprealloc", "disable data file preallocation")
+        ("nssize", po::value<int>()->default_value(16), ".ns file size (in MB) for new databases")
         ("oplog", po::value<int>(), "0=off 1=W 2=R 3=both 7=W+some reads")
         ("sysinfo", "print some diagnostic system information")
 #if defined(_WIN32)
@@ -499,7 +521,7 @@ int main(int argc, char* argv[], char *envp[] )
         hidden_options.add_options()(s.c_str(), "verbose");
     }
 
-    positional_options.add("command", -1);
+    positional_options.add("command", 3);
     visible_options.add(general_options).add(replication_options);
     cmdline_options.add(general_options).add(replication_options).add(hidden_options);
 
@@ -537,10 +559,11 @@ int main(int argc, char* argv[], char *envp[] )
         }
 
         /* don't allow guessing - creates ambiguities when some options are
-         * prefixes of others. */
-        int command_line_style = (po::command_line_style::unix_style ^
-                                  po::command_line_style::allow_guessing |
-                                  po::command_line_style::allow_long_disguise ^
+         * prefixes of others. allow long disguises and don't allow guessing
+         * to get away with our vvvvvvv trick. */
+        int command_line_style = (((po::command_line_style::unix_style ^
+                                    po::command_line_style::allow_guessing) |
+                                   po::command_line_style::allow_long_disguise) ^
                                   po::command_line_style::allow_sticky);
 
         try {
@@ -571,7 +594,7 @@ int main(int argc, char* argv[], char *envp[] )
             show_help_text(visible_options);
             return 0;
         }
-        dbpath = params["dbpath"].as<string>().c_str();
+        dbpath = params["dbpath"].as<string>();
         if (params.count("quiet")) {
             quiet = true;
         }
@@ -614,11 +637,14 @@ int main(int argc, char* argv[], char *envp[] )
         if (params.count("noscripting")) {
             useJNI = false;
         }
+        if (params.count("noprealloc")) {
+            prealloc = false;
+        }
         if (params.count("oplog")) {
             int x = params["oplog"].as<int>();
             if ( x < 0 || x > 7 ) {
                 out() << "can't interpret --oplog setting" << endl;
-                dbexit(13);
+                dbexit( EXIT_BADOPTIONS );
             }
             opLogging = x;
         }
@@ -646,7 +672,7 @@ int main(int argc, char* argv[], char *envp[] )
             master = true;
         }
         if (params.count("slave")) {
-            slave = true;
+			slave = SimpleSlave;
         }
         if (params.count("source")) {
             /* specifies what the source in local.sources should be */
@@ -669,6 +695,12 @@ int main(int argc, char* argv[], char *envp[] )
         if (params.count("autoresync")) {
             autoresync = true;
         }
+		if( params.count("nssize") ) { 
+            int x = params["nssize"].as<int>();
+            uassert("bad --nssize arg", x > 0 && x <= (0x7fffffff/1024/1024));
+			lenForNewNsFiles = x * 1024 * 1024;
+            assert(lenForNewNsFiles > 0);
+		}
         if (params.count("oplogSize")) {
             long x = params["oplogSize"].as<long>();
             uassert("bad --oplogSize arg", x > 0);
@@ -701,11 +733,6 @@ int main(int argc, char* argv[], char *envp[] )
             if (command[0].compare("msg") == 0) {
                 const char *m;
 
-                if (command.size() > 3) {
-                    cout << "Too many parameters to 'msg' command" << endl;
-                    cout << visible_options << endl;
-                    return 0;
-                }
                 if (command.size() < 3) {
                     cout << "Too few parameters to 'msg' command" << endl;
                     cout << visible_options << endl;
@@ -733,28 +760,30 @@ int main(int argc, char* argv[], char *envp[] )
             return 0;
         }
 
-        #if defined(_WIN32)
+#if defined(_WIN32)
         if ( installService ) {
             if ( !ServiceController::installService( L"MongoDB", L"Mongo DB", L"Mongo DB Server", argc, argv ) )
-                dbexit( 1 );
+                dbexit( EXIT_NTSERVICE_ERROR );
+            dbexit( EXIT_CLEAN );
         }
         else if ( removeService ) {
             if ( !ServiceController::removeService( L"MongoDB" ) )
-                dbexit( 1 );
+                dbexit( EXIT_NTSERVICE_ERROR );
+            dbexit( EXIT_CLEAN );
         }
         else if ( startService ) {
             if ( !ServiceController::startService( L"MongoDB", mongo::initService ) )
-                dbexit( 1 );
+                dbexit( EXIT_NTSERVICE_ERROR );
+            dbexit( EXIT_CLEAN );
         }
-        else
-        #endif
-            initAndListen( port, appsrvPath );
-
-        dbexit(0);
+#endif
+    } 
+    else {
+        cout << dbExecCommand << " --help for help and startup options" << endl;
     }
 
-    show_help_text(visible_options);
-
+    initAndListen(port, appsrvPath);
+    dbexit(EXIT_CLEAN);
     return 0;
 }
 
@@ -797,7 +826,7 @@ namespace mongo {
         oss << "Backtrace:" << endl;
         printStackTrace( oss );
         rawOut( oss.str() );
-        exit(14);
+        dbexit( EXIT_ABRUBT );
     }
 
     sigset_t asyncSignals;
@@ -810,7 +839,7 @@ namespace mongo {
         {
             dblock lk;
             log() << "now exiting" << endl;
-            exit(12);
+            dbexit( EXIT_KILL );
         }
     }
 
@@ -829,7 +858,47 @@ namespace mongo {
     }
 
 #else
-    void setupSignals() {}
+void ctrlCTerminate() {
+    log() << "got kill or ctrl c signal, will terminate after current cmd ends" << endl;
+    {
+        dblock lk;
+        log() << "now exiting" << endl;
+        dbexit( EXIT_KILL );
+    }
+}
+BOOL CtrlHandler( DWORD fdwCtrlType ) 
+{ 
+    switch( fdwCtrlType ) 
+    { 
+    case CTRL_C_EVENT: 
+        rawOut("Ctrl-C signal\n");
+        ctrlCTerminate();
+        return( TRUE );
+    case CTRL_CLOSE_EVENT: 
+        rawOut("CTRL_CLOSE_EVENT signal\n");
+        ctrlCTerminate();
+        return( TRUE ); 
+    case CTRL_BREAK_EVENT: 
+        rawOut("CTRL_BREAK_EVENT signal\n");
+        ctrlCTerminate();
+        return TRUE;
+    case CTRL_LOGOFF_EVENT: 
+        rawOut("CTRL_LOGOFF_EVENT signal (ignored)\n");
+        return FALSE; 
+    case CTRL_SHUTDOWN_EVENT: 
+         rawOut("CTRL_SHUTDOWN_EVENT signal (ignored)\n");
+         return FALSE; 
+    default: 
+        return FALSE; 
+    } 
+} 
+
+    void setupSignals() {
+        if( SetConsoleCtrlHandler( (PHANDLER_ROUTINE) CtrlHandler, TRUE ) ) 
+            ;
+        else
+            massert("Couldn't register Ctrl-C handler", false);
+    } 
 #endif
 
 } // namespace mongo

@@ -41,7 +41,7 @@ namespace mongo {
 #define LOGSOME if( ++nloggedsome < 1000 || nloggedsome % 100 == 0 )
 
     bool quota = false;
-    bool slave = false;
+    SlaveTypes slave = NotSlave;
     bool master = false; // true means keep an op log
     extern int curOp;
     bool autoresync = false;
@@ -290,7 +290,7 @@ namespace mongo {
     /* cl - database name
        path - db directory
     */
-    void closeClient( const char *cl, const char *path ) {
+    void closeClient( const char *cl, const string& path ) {
         assert( database );
         assert( database->name == cl );
         if ( string("local") != cl ) {
@@ -377,9 +377,6 @@ namespace mongo {
                 }
             }
 
-            // Check before setClient() to avoid creating ns unnecessarily.
-            uassert( "not master", isMasterNs( q.ns ) || (q.queryOptions & Option_SlaveOk) || strstr( q.ns, ".$cmd" ) );
-            
             setClient( q.ns );
             Top::setRead();
             strncpy(currentOp.ns, q.ns, Namespace::MaxNsLen);
@@ -471,7 +468,7 @@ namespace mongo {
         while ( d.moreJSObjs() ) {
             BSONObj js = d.nextJsObj();
 
-            theDataFileMgr.insert(ns, js);
+            theDataFileMgr.insert(ns, js, false);
             logOp("i", ns, js);
         }
     }
@@ -643,8 +640,12 @@ namespace mongo {
     bool firstExit = true;
     void shutdown();
 
+    bool inShutdown(){
+        return ! firstExit;
+    }
+
     /* not using log() herein in case we are already locked */
-    void dbexit(int rc, const char *why) {        
+    void dbexit( ExitCode rc, const char *why) {        
         {
             boostlock lk( exitMutex );
             if ( !firstExit ) {
@@ -699,8 +700,10 @@ namespace mongo {
         recCacheCloseAll();
         
 #if !defined(_WIN32) && !defined(__sunos__)
-        assert( ftruncate( lockFile , 0 ) == 0 );
-        flock( lockFile, LOCK_UN );
+        if ( lockFile ){
+            assert( ftruncate( lockFile , 0 ) == 0 );
+            flock( lockFile, LOCK_UN );
+        }
 #endif
     }
 
